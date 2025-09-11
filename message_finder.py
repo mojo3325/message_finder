@@ -31,10 +31,13 @@ TELEGRAM_API_HASH = ""
 TELEGRAM_STRING_SESSION = "REDACTED_STRING_SESSION="
 TELEGRAM_SESSION_PATH = "session"
 
+# CEREBRAS_API_KEY = "REDACTED_CEREBRAS_KEY"
 CEREBRAS_API_KEY = "REDACTED_CEREBRAS_KEY"
 
 # Bot API for notifications
 TELEGRAM_BOT_TOKEN = "REDACTED_TELEGRAM_BOT_TOKEN"
+
+GROQ_API_KEY = "REDACTED_GROQ_KEY"
 
 # Optional: limit processing to a single chat during tests (disabled by default)
 _TEST_ONLY_CHAT_ID_RAW = os.getenv("TEST_ONLY_CHAT_ID", "").strip()
@@ -54,6 +57,9 @@ SUBSCRIBER_STORE_PATH = os.getenv("SUBSCRIBER_STORE_PATH", "/data/subscribers.js
 # ------------------------------
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
+        # Allow plain, human-readable lines when requested
+        if getattr(record, "plain", False):
+            return record.getMessage()
         payload = {
             "level": record.levelname,
             "message": record.getMessage(),
@@ -71,6 +77,10 @@ handler = logging.StreamHandler()
 handler.setFormatter(JsonLogFormatter())
 logging.basicConfig(level=LOG_LEVEL, handlers=[handler])
 logger = logging.getLogger("message_finder")
+
+# Minimize noisy third-party logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telethon").setLevel(logging.WARNING)
 
 
 # ------------------------------
@@ -256,6 +266,7 @@ def classify_with_cerebras_sync(message_text: str) -> str:
                 ],
                 temperature=0.0,
                 max_tokens=1,
+                top_p=0.8,
             )
             raw = (response.choices[0].message.content or "").strip()
             if raw not in {"0", "1"}:
@@ -293,18 +304,24 @@ def generate_reply_sync(message_text: str, context: Optional[str] = None) -> str
             if context and context.strip():
                 user_content_parts.append(f"CONTEXT (may be truncated):\n{context.strip()}")
             user_content_parts.append(f"CURRENT_MESSAGE:\n{safe_text}")
+            # Compose final user input for the model (log to verify context inclusion)
+            user_content = "\n\n".join(user_content_parts)
+            logger.info(f"replier input:\n{user_content}", extra={"plain": True})
+
             response = client.chat.completions.create(
                 model="qwen-3-235b-a22b-instruct-2507",
                 messages=[
                     {"role": "system", "content": DIALOGUE_PROMPT},
-                    {"role": "user", "content": "\n\n".join(user_content_parts)},
+                    {"role": "user", "content": user_content},
                 ],
                 temperature=0.7,
                 max_tokens=48,
+                top_p=0.8,
             )
             raw = (response.choices[0].message.content or "").strip()
             # Normalize to a single short sentence without fluff
             text = normalize_short_reply(raw)
+            logger.info(f"replier output:\n{text}", extra={"plain": True})
             return text or "Давай уточним цель в одном предложении."
         except Exception as e:  # noqa: BLE001
             attempts += 1
@@ -375,6 +392,13 @@ def normalize_short_reply(raw: str) -> str:
         return text[: m.start() + 1].strip()
     # Otherwise, return as-is; add a period if it seems unfinished
     return (text + ".") if not text.endswith((".", "!", "?", "…")) else text
+
+
+def build_message_preview(text: str, limit: int = 160) -> str:
+    normalized = " ".join((text or "").strip().split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1] + "…"
 
 
 # ------------------------------
@@ -911,17 +935,7 @@ async def worker(queue: "asyncio.Queue[Tuple[events.NewMessage.Event, str]]") ->
             label = await classify_with_cerebras(text)
             latency_ms = int((time.time() - t0) * 1000)
 
-            logger.info(
-                "classified",
-                extra={
-                    "extra": {
-                        "chat_id": int(event.chat_id),  # type: ignore[arg-type]
-                        "message_id": int(event.id),
-                        "latency_ms": latency_ms,
-                        "label": label,
-                    }
-                },
-            )
+            logger.info(f"message: {text}\nlabel: {label}", extra={"plain": True})
 
             if label == "1":
                 link = await build_message_link(event)
@@ -962,16 +976,6 @@ async def worker(queue: "asyncio.Queue[Tuple[events.NewMessage.Event, str]]") ->
                                 context_plain=context_plain,
                             )
                             sent += 1
-                            logger.info(
-                                "notified_subscriber",
-                                extra={
-                                    "extra": {
-                                        "chat_id": int(event.chat_id),  # type: ignore[arg-type]
-                                        "message_id": int(event.id),
-                                        "recipient": int(recipient_id),
-                                    }
-                                },
-                            )
                         except Exception as e:  # noqa: BLE001
                             logger.error(
                                 "notify_error",
@@ -984,17 +988,7 @@ async def worker(queue: "asyncio.Queue[Tuple[events.NewMessage.Event, str]]") ->
                                     }
                                 },
                             )
-                    logger.info(
-                        "broadcast_done",
-                        extra={
-                            "extra": {
-                                "chat_id": int(event.chat_id),  # type: ignore[arg-type]
-                                "message_id": int(event.id),
-                                "sent": sent,
-                                "total_subscribers": total,
-                            }
-                        },
-                    )
+                    # delivery summary suppressed per user request
 
             dedup_store.mark(event.chat_id, event.id)  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001
