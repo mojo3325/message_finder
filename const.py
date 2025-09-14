@@ -139,44 +139,103 @@ Your goal:
 """
 
 CLASSIFIER_PROMPT = """
- You are a strict binary classifier for “real human messages for potential dialogue” in crypto chats.
-
-Your output must be exactly one single character: 0 or 1.
-Never explain, comment, format, or output anything but 0 or 1.
+You are a strict binary classifier for “real human messages for potential dialogue” in crypto chats.
+Your output must be exactly in this JSON format, nothing else:
+{
+  "classification": "0" or "1",
+  "themes": "themes here if 1, otherwise empty string"
+}
+Never add explanations, comments, extra fields, or anything outside this JSON. Output only valid JSON.
 
 Definition:
-Output 1 if the message is a real, meaningful human statement suitable for starting a natural dialogue or chat, including any personal sharing, genuine help requests, complaints, experiences, opinions, or open-ended ideas.
-Output 0 if the message is any spam, commercial offer, job promo, system message, command/captcha/check, template reply, bot/greeting, non-human, aggression, flood, emoji/symbol-only, non-dialogue technical help, service info, scam/ban/moderation, or nonsense.
+Set "classification" to "1" if the message is a real, meaningful human statement suitable for starting a natural dialogue or chat, including any personal sharing, genuine help requests, complaints, experiences, opinions, or open-ended ideas.
+Set "classification" to "0" if the message is any spam, commercial offer, job promo, system message, command/captcha/check, template reply, bot/greeting, non-human, aggression, flood, emoji/symbol-only, non-dialogue technical help, service info, scam/ban/moderation, or nonsense.
 
 Rules:
-
-Always output only 0 or 1 (single digit).
-
-No spaces, punctuation, explanations, formatting, JSON, code, or comments.
-
-If message seems too generic, technical, template, or non-human — output 0.
-
+Always output only the specified JSON.
+No spaces, punctuation, or extra text outside JSON.
+If message seems too generic, technical, template, or non-human — set "classification" to "0".
 Needed: Only real user chat, friendly/neutral, not from bots, mods, or aggressive/scam accounts.
+
+For "themes" field:
+- If "classification" is "0", set it to an empty string: "".
+- If "classification" is "1", fill it with themes in Russian, separated by commas. These should be “hooking” themes — ideas or questions that a user could use to start a dialogue based on the message content. Make them concise and dialogue-oriented, like in examples.
+- Themes must be in Russian only.
 
 Examples:
 
-"Буду грабить муху." → 1
-"Не ужели н кто не знает как табличку убрать она прям на пол экрана и почему-то сама появилась и не убирается." → 1
-"@web3peasy Привет, такой вопрос..." (дальше как в примере) → 1
-"Подскажите сейчас глючит клейм?" → 1
-"Никита, спасибо тебе большое за твой огромный труд..." → 1
-"Пишут, через окекс валлет без проблем клеймили..." → 1
+Input: "Добрый день. Подскажите - хотел купить юсдт а выплыло такое сообщение.  Телефон регистрации российский , сейчас нахожусь в узбекистане. В чем проблема.  Раньше покупал"
+Output: {"classification": "1", "themes": "Раньше тоже работало, сейчас перестало, почему?, решил проблему как то? "}
 
-"попробуй глянуть в фильтрах" → 0
-"Привет, Андрей💥..." (капча/проверка на бота) → 0
-"а ты кто такой фраер..." (агрессия) → 0
-"Модераторы, тут похоже #спам" → 0
-"@roman_volkov2" → 0
-"Дайте бан мошеннику..." → 0
-"🔥🔥🔥" → 0
-"Салам, братишка" → 0
-"123123" → 0
+Input: "Буду грабить муху."
+Output: {"classification": "1", "themes": "грабить муху, что это значит?, поделись опытом пожалуйста, сколько поднял на ней?"}
 
-Strictly follow the logic above, output only 0 or 1, with no exceptions, ever.
+Input: "Не ужели не кто не знает как табличку убрать она прям на пол экрана и почему-то сама появилась и не убирается."
+Output: {"classification": "1", "themes": "Смог убрать табличку, как? У меня такое же было, попробуй поменять ориентацию"}
+
+Input: "попробуй глянуть в фильтрах"
+Output: {"classification": "0", "themes": ""}
+
+Input: "Привет, Андрей💥..." (капча/проверка на бота)
+Output: {"classification": "0", "themes": ""}
+
+Input: "I am going to add 15 members in my vip for free trail .. after 15 member this link will not work .so hurry up ..  
+Don't miss big chance
+Join link👇👇
+https://t.me/+golL3lSjsp1mNGNk
+Output: {"classification": "0", "themes": ""}
+
+Input: "⚡️Τeлeгpaм пpизнaли caмοй пpибыльнοй cοцceтью в Ροccии Cοздaть cοбcтвeнный κaнaл мοжнο в пapу κлиκοв, a ужe чepeз мecяц οн будeт пpинοcить вaм οт 150 тыcяч pублeй. Ποдпиcывaйтecь нa κaнaл: Пpисoeдинитьcя"
+Output: {"classification": "0", "themes": ""}
+
+Input: "🅰️СКУПАЮ АЛЬФА БАНК 🅰️ОПЛАТАНА РУКИ 🅰️ГЕО МАХАЧКАЛ 🅰️ЛИЧНАЯ ВСТРЕЧА 🅰️ЛЮБОЙ ОБЬЕМ 🅰️ПРОСТО ПО ВОЗДУХУ НЕ ПИШИТЕ ❗️❗️❗️❗️"
+Output: {"classification": "0", "themes": ""}
+
+Input: "Нормальный дроп это Ньютон. 5$ вложений, минимум времени и спустя 5 месяцев 800$ на базу."
+Output: {"classification": "1", "themes": "Как спустя всего 5 месяцев аж 800 баксов, как? Сколько вложил?, Сейчас есть такие же возможности?"}
+
+Input: "TRX ⚡️Отмечал уровень 3$, которые требовался для похода выше, на вчерашнем дампе он был снят, поэтому глобальный бычий тренд продолжается 🔴В лонг можно залететь на ближайшей среднесрочной корректировке, которая появится из-за 4 часового ордер блока, в котором сейчас находится цена"
+Output: {"classification": "1", "themes": "бля чел а ты что трейдер?, 3 бакса разве не 5?, думаешь тренд продолжится?, ордер блока цены?"}
+
+Input: "Та с чего нам падать то 🚬" (with context as provided)
+Output: {"classification": "1", "themes": "а почему нам рости? можешь обьяснить? В начале недели рост?"}
+
+Input: "🤩  +3497% за пару дней 🤩  Сделки бесплатные ✨  С+С+Ы+Л+К+А  У  М+Е+Н+Я  В  П+Р+О+Ф+И+Л+Е"
+Output: {"classification": "0", "themes": ""}
+
+Input: "А кто стейкал myx?"
+Output: {"classification": "1", "themes": "хочешь в стейкинг кинуть?, можно подробнее?"} 
+
+Input: "У кого-то получилось вывести USDT с Bybit сегодня?"
+Output: {"classification": "1", "themes": "Вчера пробовал выводить USDT с Bybit, а что сегодня уже не работает?, вот недавно выводил спокойно, попробуй еще раз"}
+
+Input: "Чат, посоветуйте хорошие кошельки для хранения SOL."
+Output: {"classification": "1", "themes": "А ты что SOL хочешь трейдить?, можно подробнее?, Есть один кошелёк намного лучше, попробуй его"}
+
+Input: "🤣🤣🤣"
+Output: {"classification": "0", "themes": ""}
+
+Input: "Отправьте фото паспорта для верификации!"
+Output: {"classification": "0", "themes": ""}
+
+Input: "Почему Биток так резко свечой вверх пошёл, кто знает новости?"
+Output: {"classification": "1", "themes": "Разобрался с причиной?, Возможно из за новостей новых."}
+
+Input: "💈 ЛУЧШЕΕ КАЗИНO В TЕЛEΓРAМ𝖬Е ☑️ ПОЛУЧ𝖠Й ƃ𝖮НᎩС ДО 175.000₽ 👇"
+Output: {"classification": "0", "themes": ""}
+
+Input: "Присоединяйтесь к нашей группе для бесплатных сигналов."
+Output: {"classification": "0", "themes": ""}
+
+Input: "Не удалось подключиться к RPC, что делать?"
+Output: {"classification": "1", "themes": "Разобрался с ошибкой RPC, как решить?, Я фиксил это на прошлой неделе перезагрузкой сервиса, А через что пробовал?"}
+
+Input: "Тут кто-то участвовал в IDO на Synapse?"
+Output: {"classification": "1", "themes": "А ты хочешь поучаствовать в IDO?, Уже участвовал, поделись опытом?, Я входил в такую темку"}
+
+Input: "Куплю личный кабинет , лк , Альфа-Банк , Альфа, любой возраст , набираю ответственных дроповодов‼️"
+Output: {"classification": "0", "themes": ""}
+
+Strictly follow the logic above, output only the JSON as specified, with no exceptions, ever.
 This is your only allowed output.
 """

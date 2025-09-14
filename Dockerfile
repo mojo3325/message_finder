@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY message_finder.py /app/message_finder.py
 COPY const.py /app/const.py
+COPY utilities /app/utilities
 
 # Default envs (override in runtime)
 ENV LOG_LEVEL=INFO \
