@@ -7,6 +7,7 @@ import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional, Set, Tuple, List, TypedDict
 import re
+import filelock
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -147,12 +148,13 @@ subscriber_store = SupabaseSubscriberStore(SUPABASE_URL, SUPABASE_ANON_KEY)
 # UI State for Reply Generation
 # ------------------------------
 class ReplyUIState:
-    def __init__(self, user_id: int, original_body_html: str, original_text: str, context_for_model: Optional[str] = None) -> None:
+    def __init__(self, user_id: int, original_body_html: str, original_text: str, context_for_model: Optional[str] = None, classification_result: Optional["ClassificationResult"] = None) -> None:
         self.user_id = int(user_id)
         self.original_body_html = original_body_html
         self.original_text = original_text
         self.context_for_model = context_for_model
         self.last_reply_text: Optional[str] = None
+        self.classification_result = classification_result
 
 
 class ReplyUIStore:
@@ -160,10 +162,10 @@ class ReplyUIStore:
         self._seq = 0
         self._states: Dict[str, ReplyUIState] = {}
 
-    def create(self, user_id: int, original_body_html: str, original_text: str, context_for_model: Optional[str] = None) -> str:
+    def create(self, user_id: int, original_body_html: str, original_text: str, context_for_model: Optional[str] = None, classification_result: Optional["ClassificationResult"] = None) -> str:
         self._seq += 1
         sid = f"s{self._seq}"
-        self._states[sid] = ReplyUIState(user_id=user_id, original_body_html=original_body_html, original_text=original_text, context_for_model=context_for_model)
+        self._states[sid] = ReplyUIState(user_id=user_id, original_body_html=original_body_html, original_text=original_text, context_for_model=context_for_model, classification_result=classification_result)
         return sid
 
     def get(self, sid: str) -> Optional[ReplyUIState]:
@@ -248,6 +250,33 @@ def get_http_client() -> httpx.AsyncClient:
         return _http_client
     _http_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S)
     return _http_client
+
+
+# Path for feedback data
+FEEDBACK_FILE_PATH = "data/feedback.json"
+LOCK_FILE_PATH = "data/feedback.json.lock"
+
+def save_feedback(feedback_data: dict):
+    """Appends a feedback entry to the feedback JSON file in a thread-safe way."""
+    os.makedirs(os.path.dirname(FEEDBACK_FILE_PATH), exist_ok=True)
+    lock = filelock.FileLock(LOCK_FILE_PATH)
+    with lock:
+        examples = []
+        if os.path.exists(FEEDBACK_FILE_PATH):
+            try:
+                with open(FEEDBACK_FILE_PATH, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if content.strip():
+                        examples = json.loads(content)
+                    else:
+                        examples = []
+            except (json.JSONDecodeError, FileNotFoundError):
+                examples = []
+
+        examples.append(feedback_data)
+
+        with open(FEEDBACK_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(examples, f, ensure_ascii=False, indent=2)
 
 
 class ClassificationResult(TypedDict):
@@ -335,11 +364,75 @@ def _parse_classifier_json(raw: str) -> ClassificationResult:
     return {"classification": cls, "themes": themes}
 
 
+def load_feedback_examples() -> list[str]:
+    """Loads and formats feedback examples from the JSON file."""
+    if not os.path.exists(FEEDBACK_FILE_PATH):
+        return []
+
+    lock = filelock.FileLock(LOCK_FILE_PATH)
+    with lock:
+        try:
+            with open(FEEDBACK_FILE_PATH, "r", encoding="utf-8") as f:
+                content = f.read()
+                if not content.strip():
+                    return []
+                examples_data = json.loads(content)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+
+    formatted_examples = []
+    for ex in examples_data:
+        message = ex.get("message", "")
+        output = ex.get("output", {})
+        label = ex.get("label")
+
+        if not message or not isinstance(output, dict) or label is None:
+            continue
+
+        # Correct the classification based on the user's feedback label
+        if label == 0:
+            original_classification = output.get("classification")
+            if original_classification == "1":
+                corrected_classification = "0"
+                corrected_themes = ""
+            elif original_classification == "0":
+                corrected_classification = "1"
+                corrected_themes = "" # Cannot generate new themes, so leave empty.
+            else:
+                continue # Skip invalid original classification
+
+            corrected_output = {
+                "classification": corrected_classification,
+                "themes": corrected_themes
+            }
+            output_str = json.dumps(corrected_output, ensure_ascii=False)
+        else: # label == 1, use the original classification
+            output_str = json.dumps(output, ensure_ascii=False)
+
+        # Use json.dumps for the message to handle quotes inside the string properly
+        formatted_examples.append(f'Input: {json.dumps(message, ensure_ascii=False)}\nOutput: {output_str}')
+
+    return formatted_examples
+
+
 def classify_with_openai_sync(message_text: str, context: Optional[str] = None) -> ClassificationResult:
     if not message_text or not message_text.strip():
         return {"classification": "0", "themes": ""}
 
     global _cerebras_use_extra_key, _local_fallback_active
+
+    # Dynamically build the classifier prompt
+    feedback_examples = load_feedback_examples()
+    if feedback_examples:
+        # Inject new examples after the "Examples:" line in the base prompt
+        feedback_examples_str = "\n\n".join(feedback_examples)
+        parts = CLASSIFIER_PROMPT.split("Examples:", 1)
+        if len(parts) == 2:
+            dynamic_classifier_prompt = f"{parts[0]}Examples:\n\n{feedback_examples_str}\n\n{parts[1]}"
+        else:
+            dynamic_classifier_prompt = CLASSIFIER_PROMPT
+    else:
+        dynamic_classifier_prompt = CLASSIFIER_PROMPT
 
     attempts = 0
     while True:
@@ -399,6 +492,7 @@ def classify_with_openai_sync(message_text: str, context: Optional[str] = None) 
                 # - no sampling params; use server defaults
                 base_kwargs: Dict[str, Any] = dict(
                     messages=[
+                        {"role": "system", "content": dynamic_classifier_prompt},
                         {"role": "user", "content": user_content},
                     ]
                 )
@@ -406,7 +500,7 @@ def classify_with_openai_sync(message_text: str, context: Optional[str] = None) 
                 # Cerebras: explicit system prompt and sampling, low reasoning effort
                 base_kwargs = dict(
                     messages=[
-                        {"role": "system", "content": CLASSIFIER_PROMPT},
+                        {"role": "system", "content": dynamic_classifier_prompt},
                         {"role": "user", "content": user_content},
                     ],
                     temperature=1,
@@ -707,6 +801,7 @@ async def notifier_send(
     context_html: Optional[str] = None,
     context_plain: Optional[str] = None,
     themes: Optional[str] = None,
+    classification_result: Optional[ClassificationResult] = None,
 ) -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("bot_token_missing", extra={"extra": {"msg": "TELEGRAM_BOT_TOKEN is not set"}})
@@ -747,11 +842,14 @@ async def notifier_send(
         original_body_html=body,
         original_text=text,
         context_for_model=context_plain,
+        classification_result=classification_result,
     )
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": "⚡ Сгенерировать ответ", "callback_data": f"gen:{sid}"}
+                {"text": "👍", "callback_data": f"like:{sid}"},
+                {"text": "👎", "callback_data": f"dislike:{sid}"},
+                {"text": "✨", "callback_data": f"gen:{sid}"},
             ]
         ]
     }
@@ -1062,6 +1160,27 @@ async def bot_updates_poller() -> None:
                                     await bot_send_html_message(msg_chat_id, body, reply_markup=fallback_markup)
                             continue
 
+                        if action == "like" or action == "dislike":
+                            await bot_answer_callback_query(cb_id, text="Спасибо за отзыв!", show_alert=False)
+                            if not st or not st.classification_result:
+                                logger.warning("feedback_handler_missing_state", extra={"extra": {"sid": sid, "action": action}})
+                                continue
+
+                            feedback_data = {
+                                "message": st.original_text,
+                                "output": st.classification_result,
+                                "label": 1 if action == "like" else 0
+                            }
+
+                            try:
+                                # Using asyncio.to_thread to avoid blocking the event loop with file I/O
+                                await asyncio.to_thread(save_feedback, feedback_data)
+                                logger.info("feedback_saved", extra={"extra": {"sid": sid, "action": action}})
+                            except Exception as e:
+                                logger.error("save_feedback_failed", extra={"extra": {"error": str(e)}})
+
+                            continue
+
                         if action == "back":
                             await bot_answer_callback_query(cb_id, text="Возвращаю…", show_alert=False)
                             if not st:
@@ -1213,6 +1332,7 @@ async def worker(queue: "asyncio.Queue[Tuple[events.NewMessage.Event, str]]") ->
                                 context_html=context_html,
                                 context_plain=context_plain,
                                 themes=themes,
+                                classification_result=clf_result,
                             )
                             sent += 1
                         except Exception as e:  # noqa: BLE001
