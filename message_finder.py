@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional, Set, Tuple, List
+from typing import Any, Deque, Dict, Optional, Set, Tuple, List, TypedDict
 import re
 
 from telethon import TelegramClient, events
@@ -14,7 +14,7 @@ from telethon.tl.types import Channel, PeerUser, PeerChannel, PeerChat
 
 import httpx
 
-from cerebras.cloud.sdk import Cerebras
+from openai import OpenAI
 from const import DIALOGUE_PROMPT, CLASSIFIER_PROMPT
 
 
@@ -25,19 +25,42 @@ LOG_LEVEL = "INFO"
 REQUEST_TIMEOUT_S = 20.0
 RETRY_MAX_ATTEMPTS = 3
 
+# Detect Docker runtime to properly reach host services (e.g., LM Studio)
+def _is_running_in_docker() -> bool:
+    try:
+        return os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER") == "true"
+    except Exception:
+        return False
+
 # Hardcoded credentials per user request (TEST USE ONLY)
 TELEGRAM_API_ID = "28738574"
 TELEGRAM_API_HASH = "343d6e8a20de4a2f3cc265eafdd64f71"
 TELEGRAM_STRING_SESSION = "1AZWarzkBuzIOLASsWrjMkxeeZ5PaJoMtJSZSajB2lJEXQivilsJJHIPX6JQgSFfIVfi0dTf-LbaBHk_8N_kUyXWljBgsAPJVOL6qtTX1fgJAxTTNfkTZQq049Ad9PrlLwfU4AbNXgyYAfXV_tLobDQLALoTssGcqxXulW6b556iDc0xf7msg-QO8OIVzLI28ASxtXdbfTMrBOQ9gp3xaV5oZyp3XNCic9vtRYqPWxkCRBnlM4m8RNwaUZo86rYldDCiugbzRNZwrfqq9VYZtKQ2fTO5FFUKnMZADaBAePy7fsAKpee1IXraaBjMQeRUR6DM8iXAdqkV-ajEkyUPNmMS3IMomhOE="
 TELEGRAM_SESSION_PATH = "session"
 
-# CEREBRAS_API_KEY = "csk-5njr2er53p5dwh6ymrfj4jjf9tctx9rpr3xtw4mc6te6dd38"
-CEREBRAS_API_KEY = "csk-6p5w4vjhnk42vnvmwjncn85cvwrp3dj84n5fj26m5n56phex"
+# LM Studio (local OpenAI-compatible) configuration (Docker-aware default)
+LMSTUDIO_BASE_URL = os.getenv(
+    "LMSTUDIO_BASE_URL",
+    "http://host.docker.internal:1234" if _is_running_in_docker() else "http://127.0.0.1:1234",
+)
+LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "openai/gpt-oss-20b")
+LMSTUDIO_API_KEY = os.getenv("LMSTUDIO_API_KEY", "not-needed")
+
+# Cerebras (OpenAI-compatible) configuration for classification
+CEREBRAS_BASE_URL = os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+CEREBRAS_API_KEY = "csk-5njr2er53p5dwh6ymrfj4jjf9tctx9rpr3xtw4mc6te6dd38"
+# Extra API key to use when primary Cerebras key hits TPD
+CEREBRAS_EXTRA_API = "csk-6p5w4vjhnk42vnvmwjncn85cvwrp3dj84n5fj26m5n56phex"
 
 # Bot API for notifications
 TELEGRAM_BOT_TOKEN = "8255044221:AAH_MKTuXbuWoLn0OlJRr6amaXMbdQ3jUlg"
 
 GROQ_API_KEY = "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"
+
+# Groq OpenAI-compatible settings for reply generation
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_REPLY_MODEL = "moonshotai/kimi-k2-instruct-0905"
 
 # Optional: limit processing to a single chat during tests (disabled by default)
 _TEST_ONLY_CHAT_ID_RAW = os.getenv("TEST_ONLY_CHAT_ID", "").strip()
@@ -48,8 +71,9 @@ RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))
 RATE_LIMIT_RPH = int(os.getenv("RATE_LIMIT_RPH", "900"))
 RATE_LIMIT_TPM = int(os.getenv("RATE_LIMIT_TPM", "60000"))
 
-# Persistent subscribers store path (mounted volume recommended)
-SUBSCRIBER_STORE_PATH = os.getenv("SUBSCRIBER_STORE_PATH", "/data/subscribers.json")
+# Supabase configuration (subscribers storage)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wswatojrgeknsfqujjvi.supabase.co")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indzd2F0b2pyZ2VrbnNmcXVqanZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc2Mjc3MTgsImV4cCI6MjA3MzIwMzcxOH0.zj6HBxOIkoJsZ3qByQfipeoR4S-EbAMH7tJ__SLajtI")
 
 
 # ------------------------------
@@ -114,74 +138,9 @@ dedup_store = DedupStore()
 # ------------------------------
 # Subscriber Store (Bot API /start)
 # ------------------------------
-class SubscriberStore:
-    def __init__(self, path: str) -> None:
-        self._path = path
-        self._subscribers: Set[int] = set()
-        self._last_update_id: int = 0
-        self._load()
+from utilities.subscribers_store import SupabaseSubscriberStore
 
-    def _load(self) -> None:
-        try:
-            if not self._path:
-                return
-            if os.path.exists(self._path):
-                with open(self._path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                subs = data.get("subscribers", []) or []
-                self._subscribers = {int(x) for x in subs}
-                self._last_update_id = int(data.get("last_update_id", 0) or 0)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("subscriber_store_load_failed", extra={"extra": {"error": str(e), "path": self._path}})
-
-    def _save(self) -> None:
-        try:
-            if not self._path:
-                return
-            dirpath = os.path.dirname(self._path)
-            if dirpath:
-                os.makedirs(dirpath, exist_ok=True)
-            tmp_path = f"{self._path}.tmp"
-            payload = {
-                "subscribers": sorted(self._subscribers),
-                "last_update_id": self._last_update_id,
-            }
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False)
-            os.replace(tmp_path, self._path)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("subscriber_store_save_failed", extra={"extra": {"error": str(e), "path": self._path}})
-
-    def add(self, user_id: int) -> None:
-        before = len(self._subscribers)
-        self._subscribers.add(user_id)
-        if len(self._subscribers) != before:
-            self._save()
-
-    def remove(self, user_id: int) -> None:
-        if user_id in self._subscribers:
-            self._subscribers.remove(user_id)
-            self._save()
-
-    def contains(self, user_id: int) -> bool:
-        return user_id in self._subscribers
-
-    def snapshot(self) -> Set[int]:
-        return set(self._subscribers)
-
-    def get_offset(self) -> int:
-        return self._last_update_id
-
-    def advance_offset(self, update_id: int) -> None:
-        if update_id > self._last_update_id:
-            self._last_update_id = update_id
-            self._save()
-
-    def count(self) -> int:
-        return len(self._subscribers)
-
-
-subscriber_store = SubscriberStore(SUBSCRIBER_STORE_PATH)
+subscriber_store = SupabaseSubscriberStore(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 
 # ------------------------------
@@ -220,25 +179,67 @@ reply_ui_store = ReplyUIStore()
 
 
 # ------------------------------
-# Cerebras Classifier
+# OpenAI SDK (LM Studio) Client
 # ------------------------------
 
-_cb_client: Optional[Cerebras] = None
+_oa_client: Optional[OpenAI] = None
+_oa_client_key: Optional[str] = None
+_groq_client: Optional[OpenAI] = None
 _http_client: Optional[httpx.AsyncClient] = None
 COPY_TEXT_ALLOWED: bool = True
 
+# Switch to extra API key after TPD; then to local LM Studio
+_cerebras_use_extra_key: bool = False
+_lm_client: Optional[OpenAI] = None
+# Switch to local LM Studio after Cerebras fallback also hits TPD
+_local_fallback_active: bool = False
+_lm_model_resolved_name: Optional[str] = None
 
-def get_cerebras_client() -> Cerebras:
-    global _cb_client
-    if _cb_client is not None:
-        return _cb_client
 
-    if not CEREBRAS_API_KEY:
-        raise RuntimeError("CEREBRAS_API_KEY is required")
+def _normalize_base_url(raw: str) -> str:
+    base = (raw or "http://127.0.0.1:1234").rstrip("/")
+    return base if base.endswith("/v1") else f"{base}/v1"
 
-    # Pass API key explicitly and set retries/timeouts per docs.
-    _cb_client = Cerebras(api_key=CEREBRAS_API_KEY, max_retries=RETRY_MAX_ATTEMPTS, timeout=REQUEST_TIMEOUT_S)
-    return _cb_client
+
+def get_openai_client() -> OpenAI:
+    global _oa_client, _oa_client_key, _cerebras_use_extra_key
+    desired_key = (CEREBRAS_EXTRA_API if _cerebras_use_extra_key and CEREBRAS_EXTRA_API else CEREBRAS_API_KEY)
+    if _oa_client is not None and _oa_client_key == desired_key:
+        return _oa_client
+    # Recreate client if key changed or not initialized
+    _oa_client = OpenAI(
+        base_url=_normalize_base_url(CEREBRAS_BASE_URL),
+        api_key=desired_key,
+        timeout=REQUEST_TIMEOUT_S,
+    )
+    _oa_client_key = desired_key
+    return _oa_client
+
+
+def get_groq_client() -> OpenAI:
+    global _groq_client
+    if _groq_client is not None:
+        return _groq_client
+    _groq_client = OpenAI(
+        base_url=GROQ_BASE_URL,
+        api_key=GROQ_API_KEY,
+        timeout=REQUEST_TIMEOUT_S,
+    )
+    return _groq_client
+
+
+def get_lmstudio_client() -> OpenAI:
+    global _lm_client
+    if _lm_client is not None:
+        return _lm_client
+    _lm_client = OpenAI(
+        base_url=_normalize_base_url(LMSTUDIO_BASE_URL),
+        api_key=LMSTUDIO_API_KEY,
+        timeout=REQUEST_TIMEOUT_S,
+        # Reduce SDK-side retry latency for local server
+        max_retries=1,
+    )
+    return _lm_client
 
 
 def get_http_client() -> httpx.AsyncClient:
@@ -249,46 +250,224 @@ def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-def classify_with_cerebras_sync(message_text: str) -> str:
-    if not message_text or not message_text.strip():
-        return "0"
+class ClassificationResult(TypedDict):
+    classification: str
+    themes: str
 
-    client = get_cerebras_client()
+
+def _extract_label_from_chat_completion(cc) -> str:
+    try:
+        raw = (cc.choices[0].message.content or "").strip()
+    except Exception:
+        raw = ""
+    if raw in {"0", "1"}:
+        return raw
+    m = re.search(r"[01]", raw)
+    if m:
+        return m.group(0)
+    return "0"
+
+
+def _extract_label_from_responses(resp) -> str:
+    try:
+        raw = (getattr(resp, "output_text", None) or "").strip()
+    except Exception:
+        raw = ""
+    if raw in {"0", "1"}:
+        return raw
+    m = re.search(r"[01]", raw)
+    if m:
+        return m.group(0)
+    return "0"
+
+
+def _is_cerebras_tpd_limit_error(e: Exception) -> bool:
+    try:
+        msg = str(e).lower()
+    except Exception:
+        return False
+    # Match various representations of daily quota exhaustion and HTTP 429 limit hits
+    return (
+        "token_quota_exceeded" in msg
+        or "too_many_tokens_error" in msg
+        or "tokens per day" in msg
+        or "limit hit" in msg
+        or "http 429" in msg
+        or "rate limit" in msg
+    )
+
+
+def _parse_classifier_json(raw: str) -> ClassificationResult:
+    # Try direct JSON first
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        # Strip code fences if present
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            try:
+                first_newline = cleaned.find("\n")
+                cleaned = cleaned[first_newline + 1 :]
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3]
+            except Exception:
+                pass
+        # Try to extract first {...}
+        try:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                obj = json.loads(cleaned[start : end + 1])
+            else:
+                obj = {}
+        except Exception:
+            obj = {}
+
+    cls = str(obj.get("classification", "")).strip() if isinstance(obj, dict) else ""
+    themes = str(obj.get("themes", "")).strip() if isinstance(obj, dict) else ""
+    if cls not in {"0", "1"}:
+        # Fallback to simple extraction
+        m = re.search(r"[01]", raw)
+        cls = m.group(0) if m else "0"
+        themes = ""
+    if cls == "0":
+        themes = ""
+    return {"classification": cls, "themes": themes}
+
+
+def classify_with_openai_sync(message_text: str, context: Optional[str] = None) -> ClassificationResult:
+    if not message_text or not message_text.strip():
+        return {"classification": "0", "themes": ""}
+
+    global _cerebras_use_extra_key, _local_fallback_active
 
     attempts = 0
     while True:
         try:
-            response = client.chat.completions.create(
-                model="qwen-3-235b-a22b-instruct-2507",
-                messages=[
-                    {"role": "system", "content": CLASSIFIER_PROMPT},
-                    {"role": "user", "content": message_text.strip()},
-                ],
-                temperature=0.0,
-                max_tokens=1,
-                top_p=0.8,
-            )
-            raw = (response.choices[0].message.content or "").strip()
-            if raw not in {"0", "1"}:
-                # Invalid content per strict contract → retry limited times
-                raise ValueError(f"invalid_model_output:{raw}")
-            return raw
+            # Choose provider/model with multi-tier fallback: Cerebras primary key -> Cerebras extra key -> LM Studio
+            if _local_fallback_active:
+                client = get_lmstudio_client()
+                # Resolve actual local model name dynamically if possible
+                global _lm_model_resolved_name
+                if not _lm_model_resolved_name:
+                    try:
+                        models = client.models.list()
+                        ids = []
+                        try:
+                            ids = [m.id for m in getattr(models, "data", [])]
+                        except Exception:
+                            # Fallback for alternate SDK return shapes
+                            ids = [getattr(m, "id", None) for m in (models or []) if getattr(m, "id", None)]
+                        desired = LMSTUDIO_MODEL
+                        # Prefer exact match; otherwise look for a close match; otherwise first available
+                        if desired in ids:
+                            _lm_model_resolved_name = desired
+                        else:
+                            # Try substring heuristics for common names
+                            lowered = desired.lower()
+                            candidates = [mid for mid in ids if ("gpt" in mid.lower() and "oss" in mid.lower()) or (lowered in mid.lower())]
+                            _lm_model_resolved_name = candidates[0] if candidates else (ids[0] if ids else desired)
+                        logger.info(
+                            "lmstudio_model_selected",
+                            extra={
+                                "extra": {
+                                    "requested": desired,
+                                    "selected": _lm_model_resolved_name,
+                                    "models_count": len(ids),
+                                }
+                            },
+                        )
+                    except Exception:
+                        # If model listing fails, use configured name as-is
+                        _lm_model_resolved_name = LMSTUDIO_MODEL
+                model_name = _lm_model_resolved_name or LMSTUDIO_MODEL
+            else:
+                client = get_openai_client()
+                model_name = CEREBRAS_MODEL
+
+            # Compose user content with optional reply-chain context (mirrors replier format)
+            user_parts: List[str] = []
+            if context and context.strip():
+                user_parts.append(f"CONTEXT (may be truncated):\n{context.strip()}")
+            user_parts.append(f"CURRENT_MESSAGE:\n{message_text.strip()}")
+            user_content = "\n\n".join(user_parts)
+
+            # Provider-specific request kwargs
+            if _local_fallback_active:
+                # LM Studio: rely on server-side defaults and presets
+                # - no system prompt (assumed configured at server)
+                # - no sampling params; use server defaults
+                base_kwargs: Dict[str, Any] = dict(
+                    messages=[
+                        {"role": "user", "content": user_content},
+                    ]
+                )
+            else:
+                # Cerebras: explicit system prompt and sampling, low reasoning effort
+                base_kwargs = dict(
+                    messages=[
+                        {"role": "system", "content": CLASSIFIER_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=1,
+                    top_p=1.0,
+                    max_tokens=4000,
+                    extra_body={"reasoning_effort": "low"},
+                )
+            # Do not pass reasoning args to LM Studio to avoid 400s on some builds
+            cc = client.chat.completions.create(model=model_name, **base_kwargs)
+            raw = (cc.choices[0].message.content or "").strip()
+            return _parse_classifier_json(raw)
         except Exception as e:  # noqa: BLE001
             attempts += 1
-            # Best-effort 429 handling
-            should_retry = attempts <= RETRY_MAX_ATTEMPTS
-            if not should_retry:
-                logger.error("cerebras_call_failed", extra={"extra": {"error": str(e)}})
-                return "0"
+            # If we hit the daily tokens limit, escalate fallbacks
+            if _is_cerebras_tpd_limit_error(e):
+                if (not _cerebras_use_extra_key) and (not _local_fallback_active) and CEREBRAS_EXTRA_API:
+                    # Switch from primary Cerebras key -> extra key
+                    _cerebras_use_extra_key = True
+                    # Force reinit client with new key on next attempt
+                    logger.warning(
+                        "cerebras_tpd_switch_key",
+                        extra={
+                            "extra": {
+                                "from_key": "primary",
+                                "to_key": "extra",
+                                "model": CEREBRAS_MODEL,
+                                "error": str(e),
+                            }
+                        },
+                    )
+                    # Drop cached client to rebuild with new key
+                    global _oa_client
+                    _oa_client = None
+                    continue
+                if (not _local_fallback_active):
+                    # Switch from Cerebras (both keys) -> Local LM Studio
+                    _local_fallback_active = True
+                    logger.warning(
+                        "cerebras_tpd_switch_to_lmstudio",
+                        extra={
+                            "extra": {
+                                "from": "cerebras",
+                                "to_model": LMSTUDIO_MODEL,
+                                "to_base_url": _normalize_base_url(LMSTUDIO_BASE_URL),
+                                "error": str(e),
+                            }
+                        },
+                    )
+                    continue
+            if attempts > RETRY_MAX_ATTEMPTS:
+                logger.error("openai_classify_failed", extra={"extra": {"error": str(e)}})
+                return {"classification": "0", "themes": ""}
             time.sleep(min(2 ** attempts, 10))
 
 
-async def classify_with_cerebras(message_text: str) -> str:
-    return await asyncio.to_thread(classify_with_cerebras_sync, message_text)
+async def classify_with_openai(message_text: str, context: Optional[str] = None) -> ClassificationResult:
+    return await asyncio.to_thread(classify_with_openai_sync, message_text, context)
 
 
 # ------------------------------
-# Cerebras Replier
+# Reply Generation (LM Studio via OpenAI SDK)
 # ------------------------------
 
 def generate_reply_sync(message_text: str, context: Optional[str] = None) -> str:
@@ -296,7 +475,8 @@ def generate_reply_sync(message_text: str, context: Optional[str] = None) -> str
     if not safe_text:
         return "Можешь уточнить, что именно хочешь сделать? Я помогу."
 
-    client = get_cerebras_client()
+    # Use Groq provider for reply generation per user request
+    client = get_groq_client()
     attempts = 0
     while True:
         try:
@@ -307,18 +487,20 @@ def generate_reply_sync(message_text: str, context: Optional[str] = None) -> str
             # Compose final user input for the model (log to verify context inclusion)
             user_content = "\n\n".join(user_content_parts)
             logger.info(f"replier input:\n{user_content}", extra={"plain": True})
-
-            response = client.chat.completions.create(
-                model="qwen-3-235b-a22b-instruct-2507",
+            # Use Chat Completions (Kimi K2 does not support reasoning)
+            cc = client.chat.completions.create(
+                model=GROQ_REPLY_MODEL,
                 messages=[
                     {"role": "system", "content": DIALOGUE_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
-                temperature=0.7,
+                temperature=0.6,
+                top_p=1.0,
                 max_tokens=48,
-                top_p=0.8,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
             )
-            raw = (response.choices[0].message.content or "").strip()
+            raw = (cc.choices[0].message.content or "").strip()
             # Normalize to a single short sentence without fluff
             text = normalize_short_reply(raw)
             logger.info(f"replier output:\n{text}", extra={"plain": True})
@@ -326,13 +508,13 @@ def generate_reply_sync(message_text: str, context: Optional[str] = None) -> str
         except Exception as e:  # noqa: BLE001
             attempts += 1
             if attempts > RETRY_MAX_ATTEMPTS:
-                logger.error("cerebras_reply_failed", extra={"extra": {"error": str(e)}})
+                logger.error("openai_reply_failed", extra={"extra": {"error": str(e)}})
                 return "Секунду, пожалуйста. Кажется, сеть шалит — попробуем ещё раз?"
             time.sleep(min(2 ** attempts, 10))
 
 
 async def generate_reply(message_text: str, context: Optional[str] = None) -> str:
-    # Use same rate limiter since we consume Cerebras quota
+    # Use same rate limiter since we consume local model quota
     estimated = estimate_prompt_tokens(message_text)
     if context:
         estimated += max(1, len(context) // 4)
@@ -524,6 +706,7 @@ async def notifier_send(
     link: Optional[str],
     context_html: Optional[str] = None,
     context_plain: Optional[str] = None,
+    themes: Optional[str] = None,
 ) -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("bot_token_missing", extra={"extra": {"msg": "TELEGRAM_BOT_TOKEN is not set"}})
@@ -534,7 +717,7 @@ async def notifier_send(
     chat_title = getattr(chat, "title", None) or getattr(chat, "username", None) or chat.__class__.__name__
 
     underlined = f"<u>{escape_html(text)}</u>"
-    header = "<b>🔎 Обнаружен \"вопрос\"</b>"
+    header = "<b>🔎 Обнаружен \"возможный диалог\"</b>"
     divider = "<b>━━━━━━━━━━━━━━━━━━━━</b>"
     parts = [
         header,
@@ -547,6 +730,13 @@ async def notifier_send(
     ]
     if context_html:
         parts.extend([divider, context_html])
+    if themes and themes.strip():
+        parts.extend([
+            divider,
+            "<b>Подсказки Диалога</b>",
+            "<b>━━━━━━━━━━━━━━━━━━━━</b>",
+            escape_html(themes.strip()),
+        ])
     if link:
         parts.append(f"• <b>Ссылка</b>: <a href=\"{escape_html(link)}\">перейти</a>")
     body = "\n".join(parts)
@@ -798,7 +988,8 @@ async def bot_updates_poller() -> None:
         logger.warning("delete_webhook_failed", extra={"extra": {"error": str(e)}})
     while True:
         try:
-            offset = subscriber_store.get_offset() + 1 if subscriber_store.get_offset() else None
+            _offset_val = subscriber_store.get_offset()
+            offset = (_offset_val + 1) if _offset_val else None
             params: Dict[str, Any] = {"timeout": timeout_s}
             if offset is not None:
                 params["offset"] = offset
@@ -813,7 +1004,10 @@ async def bot_updates_poller() -> None:
                 continue
             for upd in data.get("result", []) or []:
                 upd_id = int(upd.get("update_id", 0))
-                subscriber_store.advance_offset(upd_id)
+                try:
+                    subscriber_store.advance_offset(upd_id)
+                except Exception:
+                    pass
                 # 1) Handle callback_query (inline keyboard actions)
                 callback = upd.get("callback_query")
                 if callback:
@@ -900,13 +1094,13 @@ async def bot_updates_poller() -> None:
                     user_id = int(chat.get("id"))
                     # Respect explicit opt-out
                     if isinstance(text, str) and text.strip().lower().startswith("/stop"):
-                        subscriber_store.remove(user_id)
-                        logger.info("subscriber_removed", extra={"extra": {"user_id": user_id}})
+                        if subscriber_store.remove(user_id):
+                            logger.info("subscriber_removed", extra={"extra": {"user_id": user_id}})
                     else:
                         # Any interaction with the bot counts as opt-in
                         added_before = subscriber_store.contains(user_id)
-                        subscriber_store.add(user_id)
-                        if not added_before:
+                        added_ok = subscriber_store.add(user_id)
+                        if added_ok and (not added_before):
                             logger.info("subscriber_added", extra={"extra": {"user_id": user_id}})
         except Exception as e:  # noqa: BLE001
             logger.error("bot_poller_error", extra={"extra": {"error": f"{type(e).__name__}: {e}"}})
@@ -928,26 +1122,70 @@ async def worker(queue: "asyncio.Queue[Tuple[events.NewMessage.Event, str]]") ->
                 queue.task_done()
                 continue
 
-            # Rate limit before calling Cerebras
-            await rate_limiter.acquire(estimate_prompt_tokens(text))
+            # Collect reply context once; reuse for classification and notification
+            context_plain, context_html = await collect_reply_context(event)
+
+            # Rate limit before calling Cerebras (include context in token estimate)
+            estimated_tokens = estimate_prompt_tokens(text)
+            if context_plain:
+                estimated_tokens += max(1, len(context_plain) // 4)
+            await rate_limiter.acquire(estimated_tokens)
 
             t0 = time.time()
-            label = await classify_with_cerebras(text)
+            clf_result = await classify_with_openai(text, context=context_plain)
             latency_ms = int((time.time() - t0) * 1000)
 
-            logger.info(f"message: {text}\nlabel: {label}", extra={"plain": True})
+            label = clf_result.get("classification", "0")
+            themes = clf_result.get("themes", "")
+
+            logger.info(f"message: {text}\nlabel: {label}\nthemes: {themes}", extra={"plain": True})
+
+            # Persist only selected messages (label == "1") to Supabase
+            if label == "1":
+                try:
+                    author_user_id, author_reason = await resolve_author_user_id(event)
+                    link_all = await build_message_link(event)
+                    chat_obj = await event.get_chat()
+                    chat_title = getattr(chat_obj, "title", None) or getattr(chat_obj, "username", None)
+                    chat_username = getattr(chat_obj, "username", None)
+                    chat_type = chat_obj.__class__.__name__ if chat_obj is not None else None
+                    date_ts = None
+                    try:
+                        date_ts = int(getattr(event.message, "date", None).timestamp())  # type: ignore[union-attr]
+                    except Exception:
+                        date_ts = None
+
+                    record = {
+                        "chat_id": int(event.chat_id),  # type: ignore[arg-type]
+                        "message_id": int(event.id),
+                        "author_user_id": int(author_user_id) if author_user_id is not None else None,
+                        "author_reason": author_reason,
+                        "text": text,
+                        "label": label,
+                        "themes": themes,
+                        "link": link_all,
+                        "context": context_plain,
+                        "date_ts": date_ts,
+                        "chat_title": chat_title,
+                        "chat_username": chat_username,
+                        "chat_type": chat_type,
+                    }
+                    # Offload blocking HTTP call to thread pool
+                    await asyncio.to_thread(subscriber_store.save_classified_message, record)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("persist_message_failed", extra={"extra": {"error": str(e)}})
 
             if label == "1":
-                link = await build_message_link(event)
-                chat = await event.get_chat()
+                # Reuse prepared metadata if available
+                link = link_all if 'link_all' in locals() else await build_message_link(event)
+                chat = chat_obj if 'chat_obj' in locals() else await event.get_chat()
                 # Keep original author entity for display in the notification
                 try:
                     from_user = await event.get_sender()
                 except Exception:
                     from_user = None
 
-                # Collect reply context if this message is a reply to another message/post
-                context_plain, context_html = await collect_reply_context(event)
+                # Context already collected above; use as-is
 
                 subscribers = subscriber_store.snapshot()
                 if not subscribers:
@@ -974,6 +1212,7 @@ async def worker(queue: "asyncio.Queue[Tuple[events.NewMessage.Event, str]]") ->
                                 link,
                                 context_html=context_html,
                                 context_plain=context_plain,
+                                themes=themes,
                             )
                             sent += 1
                         except Exception as e:  # noqa: BLE001
@@ -1009,8 +1248,9 @@ async def worker(queue: "asyncio.Queue[Tuple[events.NewMessage.Event, str]]") ->
 async def main() -> None:
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
         raise RuntimeError("TELEGRAM_API_ID and TELEGRAM_API_HASH are required")
-    if not CEREBRAS_API_KEY:
-        raise RuntimeError("CEREBRAS_API_KEY is required")
+    # Validate LM Studio configuration
+    if not LMSTUDIO_BASE_URL:
+        raise RuntimeError("LMSTUDIO_BASE_URL is required")
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("bot_token_missing", extra={"extra": {"msg": "TELEGRAM_BOT_TOKEN is not set; notifications disabled"}})
 
@@ -1053,9 +1293,9 @@ async def main() -> None:
             "extra": {
                 "msg": "listener running",
                 "test_only_chat_id": TEST_ONLY_CHAT_ID,
-                "subscriber_store_path": SUBSCRIBER_STORE_PATH,
                 "subscriber_count": subscriber_store.count(),
                 "subscriber_offset": subscriber_store.get_offset(),
+                "subscriber_backend": "supabase",
             }
         },
     )
