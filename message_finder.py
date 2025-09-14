@@ -492,6 +492,7 @@ def classify_with_openai_sync(message_text: str, context: Optional[str] = None) 
                 # - no sampling params; use server defaults
                 base_kwargs: Dict[str, Any] = dict(
                     messages=[
+                        {"role": "system", "content": dynamic_classifier_prompt},
                         {"role": "user", "content": user_content},
                     ]
                 )
