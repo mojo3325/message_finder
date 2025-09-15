@@ -1,0 +1,22 @@
+services:
+  message_finder:
+    build: .
+    image: message_finder
+    container_name: message_finder
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=INFO
+      - REQUEST_TIMEOUT_S=20
+      - RETRY_MAX_ATTEMPTS=3
+      - RATE_LIMIT_RPM=30
+      - RATE_LIMIT_RPH=900
+      - RATE_LIMIT_TPM=60000
+    volumes:
+      - ./data:/app/data
+      - ./results:/app/results
+    networks:
+      - message_finder_network
+
+networks:
+  message_finder_network:
+    driver: bridge

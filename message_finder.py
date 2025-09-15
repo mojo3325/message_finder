@@ -849,7 +849,7 @@ async def notifier_send(
             [
                 {"text": "👍", "callback_data": f"like:{sid}"},
                 {"text": "👎", "callback_data": f"dislike:{sid}"},
-                {"text": "✨", "callback_data": f"gen:{sid}"},
+                {"text": "✨", "callback_data": f"gen:{sid}"}
             ]
         ]
     }
@@ -1187,7 +1187,12 @@ async def bot_updates_poller() -> None:
                                 await bot_answer_callback_query(cb_id, text="Состояние не найдено", show_alert=True)
                                 continue
                             orig_keyboard = {
-                                "inline_keyboard": [[{"text": "⚡ Сгенерировать ответ", "callback_data": f"gen:{sid}"}]]
+                                "inline_keyboard": [
+                                      [
+                {"text": "👎", "callback_data": f"dislike:{sid}"},
+                {"text": "✨", "callback_data": f"gen:{sid}"}
+                                          ]
+                                ]
                             }
                             ok = await bot_edit_message_text(msg_chat_id, msg_id, st.original_body_html, reply_markup=orig_keyboard)
                             if not ok:
