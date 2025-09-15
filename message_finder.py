@@ -54,6 +54,11 @@ CEREBRAS_API_KEY = "REDACTED_CEREBRAS_KEY"
 # Extra API key to use when primary Cerebras key hits TPD
 CEREBRAS_EXTRA_API = "REDACTED_CEREBRAS_KEY"
 
+# Gemini API (third fallback)
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GEMINI_API_KEY = "REDACTED_GEMINI_KEY"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+
 # Bot API for notifications
 TELEGRAM_BOT_TOKEN = "REDACTED_TELEGRAM_BOT_TOKEN"
 
@@ -187,13 +192,15 @@ reply_ui_store = ReplyUIStore()
 _oa_client: Optional[OpenAI] = None
 _oa_client_key: Optional[str] = None
 _groq_client: Optional[OpenAI] = None
+_gemini_client: Optional[OpenAI] = None
 _http_client: Optional[httpx.AsyncClient] = None
 COPY_TEXT_ALLOWED: bool = True
 
-# Switch to extra API key after TPD; then to local LM Studio
+# Switch to extra API key after TPD; then to Gemini, then to local LM Studio
 _cerebras_use_extra_key: bool = False
+_gemini_fallback_active: bool = False
 _lm_client: Optional[OpenAI] = None
-# Switch to local LM Studio after Cerebras fallback also hits TPD
+# Switch to local LM Studio after Cerebras/Gemini fallbacks also hit TPD
 _local_fallback_active: bool = False
 _lm_model_resolved_name: Optional[str] = None
 
@@ -228,6 +235,18 @@ def get_groq_client() -> OpenAI:
         timeout=REQUEST_TIMEOUT_S,
     )
     return _groq_client
+
+
+def get_gemini_client() -> OpenAI:
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+    _gemini_client = OpenAI(
+        base_url=_normalize_base_url(GEMINI_BASE_URL),
+        api_key=GEMINI_API_KEY,
+        timeout=REQUEST_TIMEOUT_S,
+    )
+    return _gemini_client
 
 
 def get_lmstudio_client() -> OpenAI:
@@ -419,140 +438,83 @@ def classify_with_openai_sync(message_text: str, context: Optional[str] = None) 
     if not message_text or not message_text.strip():
         return {"classification": "0", "themes": ""}
 
-    global _cerebras_use_extra_key, _local_fallback_active
+    global _cerebras_use_extra_key, _gemini_fallback_active, _local_fallback_active, _lm_model_resolved_name
 
     # Dynamically build the classifier prompt
     feedback_examples = load_feedback_examples()
     if feedback_examples:
-        # Inject new examples after the "Examples:" line in the base prompt
         feedback_examples_str = "\n\n".join(feedback_examples)
         parts = CLASSIFIER_PROMPT.split("Examples:", 1)
-        if len(parts) == 2:
-            dynamic_classifier_prompt = f"{parts[0]}Examples:\n\n{feedback_examples_str}\n\n{parts[1]}"
-        else:
-            dynamic_classifier_prompt = CLASSIFIER_PROMPT
+        dynamic_classifier_prompt = f"{parts[0]}Examples:\n\n{feedback_examples_str}\n\n{parts[1]}" if len(parts) == 2 else CLASSIFIER_PROMPT
     else:
         dynamic_classifier_prompt = CLASSIFIER_PROMPT
 
     attempts = 0
     while True:
         try:
-            # Choose provider/model with multi-tier fallback: Cerebras primary key -> Cerebras extra key -> LM Studio
+            # Choose provider/model with multi-tier fallback
             if _local_fallback_active:
                 client = get_lmstudio_client()
-                # Resolve actual local model name dynamically if possible
-                global _lm_model_resolved_name
                 if not _lm_model_resolved_name:
                     try:
                         models = client.models.list()
-                        ids = []
-                        try:
-                            ids = [m.id for m in getattr(models, "data", [])]
-                        except Exception:
-                            # Fallback for alternate SDK return shapes
-                            ids = [getattr(m, "id", None) for m in (models or []) if getattr(m, "id", None)]
+                        ids = [m.id for m in getattr(models, "data", [])]
                         desired = LMSTUDIO_MODEL
-                        # Prefer exact match; otherwise look for a close match; otherwise first available
-                        if desired in ids:
-                            _lm_model_resolved_name = desired
+                        if desired in ids: _lm_model_resolved_name = desired
                         else:
-                            # Try substring heuristics for common names
-                            lowered = desired.lower()
-                            candidates = [mid for mid in ids if ("gpt" in mid.lower() and "oss" in mid.lower()) or (lowered in mid.lower())]
+                            candidates = [mid for mid in ids if "gpt" in mid.lower() and "oss" in mid.lower()]
                             _lm_model_resolved_name = candidates[0] if candidates else (ids[0] if ids else desired)
-                        logger.info(
-                            "lmstudio_model_selected",
-                            extra={
-                                "extra": {
-                                    "requested": desired,
-                                    "selected": _lm_model_resolved_name,
-                                    "models_count": len(ids),
-                                }
-                            },
-                        )
-                    except Exception:
-                        # If model listing fails, use configured name as-is
-                        _lm_model_resolved_name = LMSTUDIO_MODEL
-                model_name = _lm_model_resolved_name or LMSTUDIO_MODEL
+                        logger.info("lmstudio_model_selected", extra={"extra": {"selected": _lm_model_resolved_name}})
+                    except Exception: _lm_model_resolved_name = LMSTUDIO_MODEL
+                model_name = _lm_model_resolved_name
+            elif _gemini_fallback_active:
+                client = get_gemini_client()
+                model_name = GEMINI_MODEL
             else:
                 client = get_openai_client()
                 model_name = CEREBRAS_MODEL
 
-            # Compose user content with optional reply-chain context (mirrors replier format)
-            user_parts: List[str] = []
-            if context and context.strip():
-                user_parts.append(f"CONTEXT (may be truncated):\n{context.strip()}")
+            user_parts = [f"CONTEXT (may be truncated):\n{context.strip()}"] if context and context.strip() else []
             user_parts.append(f"CURRENT_MESSAGE:\n{message_text.strip()}")
             user_content = "\n\n".join(user_parts)
 
-            # Provider-specific request kwargs
+            # Define kwargs based on provider
             if _local_fallback_active:
-                # LM Studio: rely on server-side defaults and presets
-                # - no system prompt (assumed configured at server)
-                # - no sampling params; use server defaults
-                base_kwargs: Dict[str, Any] = dict(
-                    messages=[
-                        {"role": "system", "content": dynamic_classifier_prompt},
-                        {"role": "user", "content": user_content},
-                    ]
-                )
-            else:
-                # Cerebras: explicit system prompt and sampling, low reasoning effort
-                base_kwargs = dict(
-                    messages=[
-                        {"role": "system", "content": dynamic_classifier_prompt},
-                        {"role": "user", "content": user_content},
-                    ],
-                    temperature=1,
-                    top_p=1.0,
-                    max_tokens=4000,
-                    extra_body={"reasoning_effort": "low"},
-                )
-            # Do not pass reasoning args to LM Studio to avoid 400s on some builds
-            cc = client.chat.completions.create(model=model_name, **base_kwargs)
-            raw = (cc.choices[0].message.content or "").strip()
-            return _parse_classifier_json(raw)
-        except Exception as e:  # noqa: BLE001
+                kwargs = {"messages": [{"role": "system", "content": dynamic_classifier_prompt}, {"role": "user", "content": user_content}]}
+            elif _gemini_fallback_active:
+                kwargs = {"messages": [{"role": "system", "content": dynamic_classifier_prompt}, {"role": "user", "content": user_content}], "extra_body": {"reasoning_effort": "low"}}
+            else:  # Cerebras
+                kwargs = {"messages": [{"role": "system", "content": dynamic_classifier_prompt}, {"role": "user", "content": user_content}], "temperature": 1, "top_p": 1.0, "max_tokens": 4000, "extra_body": {"reasoning_effort": "low"}}
+
+            cc = client.chat.completions.create(model=model_name, **kwargs)
+            return _parse_classifier_json(cc.choices[0].message.content or "")
+
+        except Exception as e:
             attempts += 1
-            # If we hit the daily tokens limit, escalate fallbacks
-            if _is_cerebras_tpd_limit_error(e):
-                if (not _cerebras_use_extra_key) and (not _local_fallback_active) and CEREBRAS_EXTRA_API:
-                    # Switch from primary Cerebras key -> extra key
-                    _cerebras_use_extra_key = True
-                    # Force reinit client with new key on next attempt
-                    logger.warning(
-                        "cerebras_tpd_switch_key",
-                        extra={
-                            "extra": {
-                                "from_key": "primary",
-                                "to_key": "extra",
-                                "model": CEREBRAS_MODEL,
-                                "error": str(e),
-                            }
-                        },
-                    )
-                    # Drop cached client to rebuild with new key
-                    global _oa_client
-                    _oa_client = None
-                    continue
-                if (not _local_fallback_active):
-                    # Switch from Cerebras (both keys) -> Local LM Studio
+            is_tpd = _is_cerebras_tpd_limit_error(e)
+
+            # Fallback Logic
+            if not _local_fallback_active:
+                if _gemini_fallback_active: # If Gemini fails for any reason, switch to local
                     _local_fallback_active = True
-                    logger.warning(
-                        "cerebras_tpd_switch_to_lmstudio",
-                        extra={
-                            "extra": {
-                                "from": "cerebras",
-                                "to_model": LMSTUDIO_MODEL,
-                                "to_base_url": _normalize_base_url(LMSTUDIO_BASE_URL),
-                                "error": str(e),
-                            }
-                        },
-                    )
+                    logger.warning("gemini_fail_switch_to_lmstudio", extra={"extra": {"error": str(e)}})
                     continue
+                elif is_tpd: # If Cerebras fails with TPD
+                    if not _cerebras_use_extra_key and CEREBRAS_EXTRA_API:
+                        _cerebras_use_extra_key = True
+                        logger.warning("cerebras_tpd_switch_key", extra={"extra": {"error": str(e)}})
+                        global _oa_client
+                        _oa_client = None  # Force re-init
+                        continue
+                    else: # Both Cerebras keys failed, switch to Gemini
+                        _gemini_fallback_active = True
+                        logger.warning("cerebras_tpd_switch_to_gemini", extra={"extra": {"error": str(e)}})
+                        continue
+
             if attempts > RETRY_MAX_ATTEMPTS:
-                logger.error("openai_classify_failed", extra={"extra": {"error": str(e)}})
+                logger.error("openai_classify_failed_all_fallbacks", extra={"extra": {"error": str(e)}})
                 return {"classification": "0", "themes": ""}
+
             time.sleep(min(2 ** attempts, 10))
 
 
