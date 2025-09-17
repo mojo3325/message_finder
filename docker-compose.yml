@@ -11,6 +11,9 @@ services:
       - RATE_LIMIT_RPM=30
       - RATE_LIMIT_RPH=900
       - RATE_LIMIT_TPM=60000
+      - GEMINI_RATE_RPM=15
+      - GEMINI_RATE_TPM=250000
+      - GEMINI_RATE_RPD=1000
     volumes:
       - ./data:/app/data
       - ./results:/app/results

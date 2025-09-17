@@ -67,6 +67,4 @@ alwaysApply: true
      - Structure routes and dependencies clearly to optimize readability and maintainability.
   
   Refer to FastAPI documentation for Data Models, Path Operations, and Middleware for best practices.
-
-  After any changes, change the available created Images and containers in docker, if they exist - update them, if not - create new ones and run the container again.
   
