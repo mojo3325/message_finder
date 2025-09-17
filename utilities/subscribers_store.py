@@ -234,7 +234,7 @@ class SupabaseSubscriberStore:
         Upsert a classified message for later aggregation/summarization.
 
         Expects keys like: chat_id, message_id, author_user_id, text, label,
-        themes, link, context, date_ts, chat_title, chat_username, chat_type, author_reason.
+        link, context, date_ts, chat_title, chat_username, chat_type, author_reason.
         """
         if not self._ensure_messages_ready():
             return False
@@ -259,7 +259,6 @@ class SupabaseSubscriberStore:
                 "author_reason": _truncate(record.get("author_reason"), 64),
                 "text": _truncate(record.get("text"), 8000),
                 "label": _truncate(record.get("label"), 8),
-                "themes": _truncate(record.get("themes"), 4000),
                 "link": _truncate(record.get("link"), 1024),
                 "context": _truncate(record.get("context"), 8000),
                 "date_ts": int(record.get("date_ts")) if record.get("date_ts") is not None else None,
@@ -283,4 +282,41 @@ class SupabaseSubscriberStore:
             logger.warning("supabase_save_message_error", extra={"extra": {"error": str(e)}})
             return False
 
+
+    def fetch_texts_by_author(self, author_user_id: int, limit: int = 200) -> list[str]:
+        """
+        Fetches up to `limit` message texts authored by the specified Telegram `author_user_id`.
+
+        Returns a list of non-empty message texts ordered by ascending date.
+        """
+        if not self._ensure_messages_ready():
+            return []
+        try:
+            safe_limit = max(1, int(limit))
+            url = (
+                f"{self._rest_base}/{self._messages_table}"
+                f"?author_user_id=eq.{int(author_user_id)}&select=text,date_ts&order=date_ts.asc&limit={safe_limit}"
+            )
+            headers = self._headers()
+            resp = self._client.get(url, headers=headers)
+            if resp.status_code >= 300:
+                logger.warning(
+                    "supabase_fetch_author_texts_failed",
+                    extra={"extra": {"status": resp.status_code, "text": resp.text}},
+                )
+                return []
+            rows = resp.json()
+            texts: list[str] = []
+            if isinstance(rows, list):
+                for r in rows:
+                    try:
+                        t = (r.get("text") or "").strip()
+                        if t:
+                            texts.append(t)
+                    except Exception:
+                        continue
+            return texts
+        except Exception as e:  # noqa: BLE001
+            logger.warning("supabase_fetch_author_texts_error", extra={"extra": {"error": str(e)}})
+            return []
 

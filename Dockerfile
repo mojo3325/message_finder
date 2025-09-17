@@ -13,10 +13,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# Copy application code
 COPY message_finder.py /app/message_finder.py
 COPY const.py /app/const.py
+COPY config.py /app/config.py
+COPY logging_config.py /app/logging_config.py
+COPY core /app/core
+COPY services /app/services
+COPY tg /app/tg
+COPY utils /app/utils
 COPY utilities /app/utilities
 COPY data /app/data
+
+# Ensure runtime directories exist
+RUN mkdir -p /app/data /app/results
 
 # Default envs (override in runtime)
 ENV LOG_LEVEL=INFO \
@@ -24,7 +34,10 @@ ENV LOG_LEVEL=INFO \
     RETRY_MAX_ATTEMPTS=3 \
     RATE_LIMIT_RPM=30 \
     RATE_LIMIT_RPH=900 \
-    RATE_LIMIT_TPM=60000
+    RATE_LIMIT_TPM=60000 \
+    GEMINI_RATE_RPM=15 \
+    GEMINI_RATE_TPM=250000 \
+    GEMINI_RATE_RPD=1000
 
 CMD ["python", "/app/message_finder.py"]
 
