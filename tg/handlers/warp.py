@@ -56,6 +56,147 @@ _WARP_DIALOG_FETCH_LIMIT: Optional[int] = 500
 _WARP_EXCLUDED_USER_IDS: tuple[int, ...] = (777000,)
 
 
+def _format_media_duration(raw_duration: Any) -> Optional[str]:
+    try:
+        seconds_float = float(raw_duration)
+    except (TypeError, ValueError):
+        return None
+    if seconds_float < 0:
+        return None
+    total_seconds = int(round(seconds_float))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _extract_document_filename(document: Any) -> Optional[str]:
+    attributes = getattr(document, "attributes", None)
+    if not isinstance(attributes, (list, tuple)):
+        return None
+    for attr in attributes:
+        filename = getattr(attr, "file_name", None)
+        if isinstance(filename, str) and filename.strip():
+            return filename.strip()
+    return None
+
+
+def _collect_media_descriptions(message: Any) -> list[tuple[str, str]]:
+    descriptions: list[tuple[str, str]] = []
+
+    photo = getattr(message, "photo", None)
+    if photo is not None:
+        descriptions.append(("🖼 Фото", "[Фото]"))
+
+    voice = getattr(message, "voice", None)
+    if voice is not None:
+        duration = _format_media_duration(getattr(voice, "duration", None))
+        if duration is None:
+            attrs = getattr(voice, "attributes", None)
+            if isinstance(attrs, (list, tuple)):
+                for attr in attrs:
+                    duration = _format_media_duration(getattr(attr, "duration", None))
+                    if duration:
+                        break
+        label = "🎙 Голосовое сообщение"
+        context_label = "[Голосовое сообщение]"
+        if duration:
+            label = f"{label} {duration}"
+            context_label = f"[Голосовое сообщение {duration}]"
+        descriptions.append((label, context_label))
+
+    video = getattr(message, "video", None)
+    video_note = getattr(message, "video_note", None)
+    video_like = video or video_note
+    if video_like is not None:
+        duration = _format_media_duration(getattr(video_like, "duration", None))
+        if duration is None:
+            attrs = getattr(video_like, "attributes", None)
+            if isinstance(attrs, (list, tuple)):
+                for attr in attrs:
+                    duration = _format_media_duration(getattr(attr, "duration", None))
+                    if duration:
+                        break
+        label = "🎬 Видео"
+        context_label = "[Видео]"
+        if duration:
+            label = f"{label} {duration}"
+            context_label = f"[Видео {duration}]"
+        descriptions.append((label, context_label))
+
+    document = getattr(message, "document", None)
+    if document is not None:
+        mime_type_raw = getattr(document, "mime_type", None)
+        mime_type = str(mime_type_raw or "")
+        filename = _extract_document_filename(document)
+        is_voice_doc = voice is not None
+        is_video_doc = video_like is not None
+        is_sticker = bool(getattr(message, "sticker", None))
+        is_gif = bool(getattr(message, "gif", None))
+
+        if mime_type.startswith("image/") and photo is None:
+            label = "🖼 Фото"
+            context_label = "[Фото]"
+            if filename:
+                label = f"{label} ({filename})"
+                context_label = f"[Фото: {filename}]"
+            descriptions.append((label, context_label))
+        elif not (is_voice_doc or is_video_doc or is_sticker or is_gif):
+            label = "📄 Документ"
+            context_label = "[Документ]"
+            detail = filename or (mime_type if mime_type else "")
+            if detail:
+                label = f"{label} ({detail})"
+                context_label = f"[Документ: {detail}]"
+            descriptions.append((label, context_label))
+
+    return descriptions
+
+
+def _build_message_preview_lines(message: Any) -> tuple[list[str], Optional[str]]:
+    raw_text = getattr(message, "message", None)
+    text_clean = str(raw_text or "").strip()
+    preview_lines: list[str] = []
+    if text_clean:
+        preview_lines.append(text_clean)
+
+    media_descriptions = _collect_media_descriptions(message)
+    media_preview_lines = [desc[0] for desc in media_descriptions if desc[0]]
+    preview_lines.extend(media_preview_lines)
+
+    media_context_parts = [desc[1] for desc in media_descriptions if desc[1]]
+    context_line: Optional[str]
+    if text_clean:
+        context_line = text_clean
+        if media_context_parts:
+            context_line = f"{context_line} {' '.join(media_context_parts)}"
+    elif media_context_parts:
+        context_line = " ".join(media_context_parts)
+    else:
+        context_line = None
+
+    return preview_lines, context_line
+
+
+def _build_dialog_preview_text(message: Any) -> Optional[str]:
+    """Format a short preview for dialog listings, including media placeholders."""
+
+    if message is None:
+        return None
+
+    preview_lines, context_line = _build_message_preview_lines(message)
+    compact_lines = [str(line).strip() for line in preview_lines if str(line).strip()]
+    preview_source = " · ".join(compact_lines)
+    if not preview_source and context_line:
+        preview_source = str(context_line).strip()
+    if not preview_source:
+        return None
+
+    candidate = shorten(preview_source)
+    return _clean_preview(candidate)
+
+
 def _normalize_for_match(text: Any) -> str:
     if not isinstance(text, str):
         return ""
@@ -417,12 +558,7 @@ async def _fetch_private_dialogs_with_preview(
                 preview = None
                 time_str = None
                 try:
-                    raw = getattr(last_msg, "message", None)
-                    if raw:
-                        candidate = shorten(str(raw))
-                        preview = _clean_preview(candidate)
-                    else:
-                        preview = None
+                    preview = _build_dialog_preview_text(last_msg)
                 except Exception:
                     preview = None
                 try:
@@ -728,24 +864,20 @@ async def _collect_warp_dialog_state(
             except Exception:
                 pass
 
-            try:
-                raw = getattr(mm, "message", None)
-            except Exception:
-                raw = None
-            text_clean = str(raw).strip() if raw else ""
+            preview_lines, context_text = _build_message_preview_lines(mm)
 
-            if text_clean and len(preview_buffer) < int(WARP_MINIATURE_LAST):
+            if preview_lines and len(preview_buffer) < int(WARP_MINIATURE_LAST):
                 is_out = bool(getattr(mm, "out", False))
                 author = "Вы" if is_out else title
                 preview_buffer.append(
                     {
                         "direction": "out" if is_out else "in",
                         "author": author,
-                        "text": text_clean,
+                        "text": "\n".join(preview_lines),
                     }
                 )
 
-            if need_context and text_clean:
+            if need_context and context_text:
                 try:
                     snd = await mm.get_sender()
                 except Exception:
@@ -764,7 +896,7 @@ async def _collect_warp_dialog_state(
                     if auser
                     else (f"id:{auid}" if auid else (f"id:{owner_uid}" if role == "OWNER" and owner_uid else "id:?"))
                 )
-                context_entries.append(f"{role} {ident}: {text_clean}")
+                context_entries.append(f"{role} {ident}: {context_text}")
                 try:
                     context_ids.append(int(getattr(mm, "id", 0) or 0))
                 except Exception:
@@ -1212,21 +1344,15 @@ async def handle_callback(
                             header_time = dt.strftime("%H:%M")
                     except Exception:
                         header_time = None
-                try:
-                    raw = getattr(msg, "message", None)
-                except Exception:
-                    raw = None
-                if not raw:
-                    continue
-                txt = str(raw).strip()
-                if not txt:
+                preview_lines, _ = _build_message_preview_lines(msg)
+                if not preview_lines:
                     continue
                 is_out = bool(getattr(msg, "out", False))
                 author = "Вы" if is_out else title
                 messages.append({
                     "direction": "out" if is_out else "in",
                     "author": author,
-                    "text": txt,
+                    "text": "\n".join(preview_lines),
                 })
             messages.reverse()
             if stop_spinner is not None:
