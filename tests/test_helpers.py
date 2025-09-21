@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import asyncio
+
 import pytest
 
 from tg import helpers
@@ -30,8 +34,7 @@ def test_build_loading_frame_contains_header_and_bar() -> None:
     assert lines[2].startswith("<code>")
 
 
-@pytest.mark.asyncio
-async def test_safe_delete_messages_no_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_safe_delete_messages_no_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     called = False
 
     async def fake_delete(chat_id: int, message_id: int) -> None:
@@ -39,12 +42,11 @@ async def test_safe_delete_messages_no_ids(monkeypatch: pytest.MonkeyPatch) -> N
         called = True
 
     monkeypatch.setattr(helpers.bot_api, "bot_delete_message", fake_delete)
-    await helpers.safe_delete_messages(123, [], attempts=2)
+    asyncio.run(helpers.safe_delete_messages(123, [], attempts=2))
     assert called is False
 
 
-@pytest.mark.asyncio
-async def test_safe_delete_messages_retries_until_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_safe_delete_messages_retries_until_success(monkeypatch: pytest.MonkeyPatch) -> None:
     call_count = 0
 
     async def flaky_delete(chat_id: int, message_id: int) -> None:
@@ -54,5 +56,5 @@ async def test_safe_delete_messages_retries_until_success(monkeypatch: pytest.Mo
             raise RuntimeError("temporary failure")
 
     monkeypatch.setattr(helpers.bot_api, "bot_delete_message", flaky_delete)
-    await helpers.safe_delete_messages(555, [42], attempts=3, retry_delay=0)
+    asyncio.run(helpers.safe_delete_messages(555, [42], attempts=3, retry_delay=0))
     assert call_count == 3
