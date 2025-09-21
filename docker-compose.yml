@@ -11,11 +11,30 @@ services:
       - RATE_LIMIT_RPM=30
       - RATE_LIMIT_RPH=900
       - RATE_LIMIT_TPM=60000
+      - GEMINI_RATE_RPM=15
+      - GEMINI_RATE_TPM=250000
+      - GEMINI_RATE_RPD=1000
     volumes:
       - ./data:/app/data
       - ./results:/app/results
     networks:
       - message_finder_network
+    command: ["python", "/app/message_finder.py"]
+
+  warp_chat:
+    image: message_finder
+    container_name: warp_chat
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=INFO
+      - REQUEST_TIMEOUT_S=20
+      - RETRY_MAX_ATTEMPTS=3
+      - ACCOUNTS_FILE=/app/data/accounts.json
+    volumes:
+      - ./data:/app/data
+    networks:
+      - message_finder_network
+    command: ["python", "/app/warp_chat.py"]
 
 networks:
   message_finder_network:

@@ -1,0 +1,28 @@
+{
+  "users": [
+    {
+      "telegram_user_id": 7304373524,
+      "phone_e164_masked": "+193******",
+      "string_session": "1AZWarzoBu74AaB2vqxP76Y5XntONugWlTvirbC-MBXok0QI2dXTyIZPVMdsrg3178g95jz1N7x9AxRtio3xPddmPs9QHOwAxe9tBCX8dswb0qOwC8TKv_9ZpGAa6F1RU5bx35hynFL1fAqNZimNhSIL_l_RzV0-ylCCrEbOmTCI2bKJPZNE5J3mub8u0QpaPASEB-0aP09dOoVZAqqHe_DJp6DnmYMtbHda0rBv4PdzU-nwMYh7qjI4iT5oktWk_xq2mzDl0OYKyjdXrUn_XMEZ57B48To-tJYJ_RShkGqtT8LRspzNWl4V_tfdVLpwRxP1-NwzsnPULbDTgFdjt19FVtu6-B0Y=",
+      "status": "active",
+      "created_at": "2025-09-20T13:35:24.938678Z",
+      "updated_at": "2025-09-20T13:35:24.938678Z",
+      "meta": {
+        "method": "phone",
+        "last_ip": null
+      }
+    },
+    {
+      "telegram_user_id": 7218089204,
+      "phone_e164_masked": "+132******",
+      "string_session": "1AZWarzoBu3mnQke3Q4LtrRgKyCHPl29smY2OnzQcqIzjDGJ5GG40_tdoCVVrMdfeQBPgUg6YH87J-xjpKAQOrdnDXBDyFya5h7vaU6AtWGUyq--_0S4_GMGGm6Tcn-dIvVQmjF753fnN9abopfvHJP2swKxYm3w1AAJtPoZlUXve1cvB-JyDjVU9RkmMGLVQ0_u3hdaVXBii04UXipQhzivPZd6pDo4S9HEIhpdQamv3FgQqHtAqBTiF8GnlfC1NvB-SbH2oJbz8eoPNX66K06uOWjvDOjQGyo_3ogeZNwZNlabcwoUM0lNzNN3tC-ZzrtHKz1emcYopU-aSXWR85labN3wzlW4=",
+      "status": "active",
+      "created_at": "2025-09-20T14:52:30.253610Z",
+      "updated_at": "2025-09-20T14:52:30.253610Z",
+      "meta": {
+        "method": "phone",
+        "last_ip": null
+      }
+    }
+  ]
+}
