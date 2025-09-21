@@ -1833,7 +1833,8 @@ async def _handle_warp_generation(
     draft_for_regen: Optional[Dict[str, Any]],
     from_user_id: int,
 ) -> None:
-
+    target_chat_id: Optional[int] = None
+    cache_user_id: Optional[int] = None
     if draft_for_regen is not None:
         try:
             target_chat_id = int(draft_for_regen.get("chat_id")) if draft_for_regen.get("chat_id") is not None else None
@@ -1878,10 +1879,27 @@ async def _handle_warp_generation(
         if not cached_ids and ctx_ids_draft:
             cached_ids = [int(x) for x in ctx_ids_draft if isinstance(x, (int, float, str))]
 
+    (
+        transcript,
+        message_ids,
+        preview_messages,
+        title,
+        header_time,
+        structured_context,
+    ) = await _collect_warp_dialog_state(
+        cache_user_id=cache_user_id,
+        acc=acc,
+        chat_id=target_chat_id,
+        cached_ctx=str(cached_ctx) if cached_ctx else None,
+        cached_ids=cached_ids,
+    )
+
+    reply_to_id = None
+
     loading_body, loading_kb = ui.build_warp_miniature(
-        "",
-        None,
-        [],
+        title,
+        header_time,
+        preview_messages,
         target_chat_id,
         loading=True,
         draft_id=draft_id,
@@ -1912,21 +1930,6 @@ async def _handle_warp_generation(
         except Exception:
             stop_spinner = None
             spinner_task = None
-
-        (
-            transcript,
-            message_ids,
-            preview_messages,
-            title,
-            header_time,
-            structured_context,
-        ) = await _collect_warp_dialog_state(
-            cache_user_id=cache_user_id,
-            acc=acc,
-            chat_id=target_chat_id,
-            cached_ctx=str(cached_ctx) if cached_ctx else None,
-            cached_ids=cached_ids,
-        )
 
         t0 = __import__("time").time()
         try:
@@ -2915,7 +2918,9 @@ async def handle_start_payload(
 
 
 async def handle_command(
-    ctx: MessageContext
+    ctx: MessageContext,
+    *,
+    get_telethon_client: Callable[[], Any],
 ) -> bool:
     user_id = ctx.user_id
     text_raw = ctx.text.strip()
@@ -3026,6 +3031,7 @@ async def handle_command(
                 stop_spinner.set()
                 await asyncio.sleep(0)
             body, kb = ui.build_warp_miniature(title, header_time, messages, target_chat_id)
+            message_id = await _deliver_warp_message(user_id, message_id, body, reply_markup=kb)
             try:
                 logger.info(
                     "open_chat",

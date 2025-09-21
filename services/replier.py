@@ -78,25 +78,6 @@ def _format_context_entry(entry: StructuredContextEntry) -> str:
     return f"{prefix}: {message_text}" if message_text else f"{prefix}:"
 
 
-def _should_add_segment(candidate: Optional[str], existing_segments: Sequence[str]) -> bool:
-    if not isinstance(candidate, str):
-        return False
-    text = candidate.strip()
-    if not text:
-        return False
-    for existing in existing_segments:
-        if not isinstance(existing, str):
-            continue
-        existing_text = existing.strip()
-        if not existing_text:
-            continue
-        if text == existing_text:
-            return False
-        if text in existing_text or existing_text in text:
-            return False
-    return True
-
-
 def _describe_media_for_log(media: Dict[str, Any]) -> str:
     label_source = media.get("display") or media.get("context") or media.get("type") or "media"
     label = str(label_source).strip() if isinstance(label_source, str) else str(label_source)
@@ -238,12 +219,10 @@ def generate_reply_sync(
                 for entry in context_entries:
                     if not isinstance(entry, dict):
                         continue
-                    entry_segments: List[str] = []
                     entry_line = _format_context_entry(entry)
                     if entry_line:
                         user_content.append({"type": "text", "text": entry_line})
                         log_lines.append(entry_line)
-                        entry_segments.append(entry_line)
                     media_list = entry.get("media")
                     if isinstance(media_list, (list, tuple)):
                         for media in media_list:
@@ -254,20 +233,16 @@ def generate_reply_sync(
                                 media_text = display_candidate.strip()
                             else:
                                 media_text = _describe_media_for_log(media)
-                            if _should_add_segment(media_text, entry_segments):
-                                user_content.append({"type": "text", "text": media_text})
-                                log_lines.append(media_text)
-                                entry_segments.append(media_text)
+                            user_content.append({"type": "text", "text": media_text})
+                            log_lines.append(media_text)
                             analysis = media.get("analysis")
                             if isinstance(analysis, dict):
                                 label = analysis.get("label")
                                 text_val = analysis.get("text")
                                 if isinstance(label, str) and label.strip() and isinstance(text_val, str) and text_val.strip():
                                     snippet = f"{label.strip()}: {text_val.strip()}"
-                                    if _should_add_segment(snippet, entry_segments):
-                                        user_content.append({"type": "text", "text": snippet})
-                                        log_lines.append(snippet)
-                                        entry_segments.append(snippet)
+                                    user_content.append({"type": "text", "text": snippet})
+                                    log_lines.append(snippet)
                             for part in _media_to_content_parts(media):
                                 user_content.append(part)
             elif context_text:
