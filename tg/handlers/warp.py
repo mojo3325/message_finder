@@ -1590,10 +1590,6 @@ async def _collect_warp_dialog_state(
     cached_ids: list[int],
 ) -> Tuple[str, list[int], list[dict], str, Optional[str]]:
     need_context = not cached_ctx or not cached_ids
-    limit_ctx = int(WARP_CONTEXT_LIMIT) if need_context else 0
-    limit_fetch = max(int(WARP_MINIATURE_LAST), limit_ctx)
-    if limit_fetch <= 0:
-        limit_fetch = int(WARP_MINIATURE_LAST)
     preview_buffer: list[dict] = []
     context_entries: list[str] = []
     structured_context: list[dict[str, Any]] = []
@@ -1628,6 +1624,31 @@ async def _collect_warp_dialog_state(
                 title = str(dialog_entry.get("title") or title)
             else:
                 title = str(chat_id)
+
+        latest_cached_id: Optional[int] = None
+        if cached_ids:
+            try:
+                latest_cached_id = int(cached_ids[-1])
+            except Exception:
+                latest_cached_id = None
+        current_latest_id: Optional[int] = None
+        if not need_context and latest_cached_id is not None:
+            try:
+                async for newest_msg in client_idx.iter_messages(entity=fetch_target, limit=1):
+                    try:
+                        current_latest_id = int(getattr(newest_msg, "id", 0) or 0)
+                    except Exception:
+                        current_latest_id = None
+                    break
+            except Exception:
+                current_latest_id = None
+            if current_latest_id is None or current_latest_id != latest_cached_id:
+                need_context = True
+
+        limit_ctx = int(WARP_CONTEXT_LIMIT) if need_context else 0
+        limit_fetch = max(int(WARP_MINIATURE_LAST), limit_ctx)
+        if limit_fetch <= 0:
+            limit_fetch = int(WARP_MINIATURE_LAST)
 
         if need_context:
             try:
