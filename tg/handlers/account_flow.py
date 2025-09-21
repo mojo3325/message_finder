@@ -9,8 +9,6 @@ from const import (
     ACCOUNT_ERROR_CODE_EXPIRED,
     ACCOUNT_ERROR_CODE_INVALID,
     ACCOUNT_ERROR_GENERIC,
-    ACCOUNT_ERROR_NEED_2FA,
-    ACCOUNT_ERROR_SESSION_INVALID,
     ACCOUNT_PROMPT_2FA,
     ACCOUNT_PROMPT_CODE,
     ACCOUNT_PROMPT_PHONE,
@@ -187,12 +185,10 @@ async def handle_callback(ctx: CallbackContext) -> bool:
 
 async def handle_message(ctx: MessageContext) -> bool:
     user_id = ctx.user_id
-    chat_id = ctx.chat_id
     message_id = ctx.message_id
     text_s = ctx.text.strip()
     lower = ctx.lower_text
     contact = ctx.contact
-    message = ctx.raw
 
     if contact:
         st = account_fsm.get(user_id)
@@ -226,7 +222,6 @@ async def handle_message(ctx: MessageContext) -> bool:
                 pass
             st.ui_aux_message_ids = []
 
-            reply_markup_fw = None
             try:
                 qr_login = await client.qr_login()
                 url = None
@@ -301,7 +296,6 @@ async def handle_message(ctx: MessageContext) -> bool:
             except Exception:
                 pass
 
-        mid_rm_opt = None
         try:
             mid_rm_opt = await bot_api.bot_send_html_message_with_id(
                 user_id,
@@ -452,7 +446,6 @@ async def handle_message(ctx: MessageContext) -> bool:
                     pass
                 st.ui_aux_message_ids = []
 
-                reply_markup_fw = None
                 try:
                     qr_login = await client.qr_login()
                     url = None
@@ -625,10 +618,8 @@ async def handle_message(ctx: MessageContext) -> bool:
                 except FloodWaitError as fw:
                     wait_s = int(getattr(fw, "seconds", 0) or 0)
                     wait_min = max(1, (wait_s + 59) // 60)
-                    reply_markup_fw = None
                     try:
                         qr_login = await client.qr_login()
-                        url = None
                         try:
                             url = getattr(qr_login, "url", None) or getattr(qr_login, "_url", None)
                         except Exception:
