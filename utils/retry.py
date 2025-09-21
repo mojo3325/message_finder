@@ -13,8 +13,10 @@ async def send_with_retries(coro_factory: Callable[[], Awaitable]):
         try:
             result = coro_factory()
             if asyncio.iscoroutine(result):
-                await result
-            return True
+                # Return the actual value produced by the awaited coroutine
+                return await result
+            # If the factory produced a non-coroutine value, return it as-is
+            return result
         except Exception as e:  # noqa: BLE001
             msg = str(e).lower()
             if "copy_text_invalid" in msg:

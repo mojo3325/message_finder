@@ -19,6 +19,22 @@ services:
       - ./results:/app/results
     networks:
       - message_finder_network
+    command: ["python", "/app/message_finder.py"]
+
+  warp_chat:
+    image: message_finder
+    container_name: warp_chat
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=INFO
+      - REQUEST_TIMEOUT_S=20
+      - RETRY_MAX_ATTEMPTS=3
+      - ACCOUNTS_FILE=/app/data/accounts.json
+    volumes:
+      - ./data:/app/data
+    networks:
+      - message_finder_network
+    command: ["python", "/app/warp_chat.py"]
 
 networks:
   message_finder_network:

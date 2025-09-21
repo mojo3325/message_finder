@@ -20,9 +20,15 @@ def _is_running_in_docker() -> bool:
 TELEGRAM_API_ID = "28738574"
 TELEGRAM_API_HASH = "343d6e8a20de4a2f3cc265eafdd64f71"
 TELEGRAM_STRING_SESSION = (
-    "1AZWarzkBuzIOLASsWrjMkxeeZ5PaJoMtJSZSajB2lJEXQivilsJJHIPX6JQgSFfIVfi0dTf-LbaBHk_8N_kUyXWljBgsAPJVOL6qtTX1fgJAxTTNfkTZQq049Ad9PrlLwfU4AbNXgyYAfXV_tLobDQLALoTssGcqxXulW6b556iDc0xf7msg-QO8OIVzLI28ASxtXdbfTMrBOQ9gp3xaV5oZyp3XNCic9vtRYqPWxkCRBnlM4m8RNwaUZo86rYldDCiugbzRNZwrfqq9VYZtKQ2fTO5FFUKnMZADaBAePy7fsAKpee1IXraaBjMQeRUR6DM8iXAdqkV-ajEkyUPNmMS3IMomhOE="
+    "1AZWarzoBu3mnQke3Q4LtrRgKyCHPl29smY2OnzQcqIzjDGJ5GG40_tdoCVVrMdfeQBPgUg6YH87J-xjpKAQOrdnDXBDyFya5h7vaU6AtWGUyq--_0S4_GMGGm6Tcn-dIvVQmjF753fnN9abopfvHJP2swKxYm3w1AAJtPoZlUXve1cvB-JyDjVU9RkmMGLVQ0_u3hdaVXBii04UXipQhzivPZd6pDo4S9HEIhpdQamv3FgQqHtAqBTiF8GnlfC1NvB-SbH2oJbz8eoPNX66K06uOWjvDOjQGyo_3ogeZNwZNlabcwoUM0lNzNN3tC-ZzrtHKz1emcYopU-aSXWR85labN3wzlW4="
 )
 TELEGRAM_SESSION_PATH = "session"
+
+# Accounts storage (per-user MTProto sessions)
+ACCOUNTS_FILE = os.getenv("ACCOUNTS_FILE", "data/accounts.json")
+# Secret for encrypting StringSession in accounts storage
+# Prefer setting via env ACCOUNTS_SECRET; fallback to TELEGRAM_API_HASH for dev
+ACCOUNTS_SECRET = os.getenv("ACCOUNTS_SECRET", TELEGRAM_API_HASH)
 
 
 # LM Studio (local OpenAI-compatible) configuration (Docker-aware default)
@@ -50,7 +56,11 @@ GEMINI_REPLY_MODEL = "gemini-2.5-flash"
 
 
 # Bot API for notifications
-TELEGRAM_BOT_TOKEN = "8255044221:AAH_MKTuXbuWoLn0OlJRr6amaXMbdQ3jUlg"
+# message_fuckerr_bot
+MESSAGE_FUCKERR_TOKEN = "8255044221:AAH_MKTuXbuWoLn0OlJRr6amaXMbdQ3jUlg"
+# warp_chat_bot
+WARP_CHAT_BOT_TOKEN = "8220906079:AAFBJgJipzzEG6t_MMaIcHJn8mJ9gUhm-os"
+WARP_BOT_USERNAME = os.getenv("WARP_BOT_USERNAME", "warp_chat_bot")
 
 
 GROQ_API_KEY = "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"
@@ -93,5 +103,15 @@ SUPABASE_ANON_KEY = os.getenv(
     "SUPABASE_ANON_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indzd2F0b2pyZ2VrbnNmcXVqanZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc2Mjc3MTgsImV4cCI6MjA3MzIwMzcxOH0.zj6HBxOIkoJsZ3qByQfipeoR4S-EbAMH7tJ__SLajtI",
 )
+# Warp Chat configuration
+# Context messages to index for generation (N)
+INDEX_CONTEXT_LIMIT = int(os.getenv("INDEX_CONTEXT_LIMIT", "40"))
+# Alias for clarity in Warp Chat code
+WARP_CONTEXT_LIMIT = int(os.getenv("WARP_CONTEXT_LIMIT", str(INDEX_CONTEXT_LIMIT)))
+# Number of last messages to show in miniature
+WARP_MINIATURE_LAST = int(os.getenv("WARP_MINIATURE_LAST", "4"))
+# Page size for private chats list
+WARP_LIST_PAGE_SIZE = int(os.getenv("WARP_LIST_PAGE_SIZE", "10"))
+
 
 

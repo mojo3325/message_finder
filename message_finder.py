@@ -11,7 +11,7 @@ from config import (
     TELEGRAM_STRING_SESSION,
     TELEGRAM_SESSION_PATH,
     LMSTUDIO_BASE_URL,
-    TELEGRAM_BOT_TOKEN,
+    MESSAGE_FUCKERR_TOKEN,
     TEST_ONLY_CHAT_ID,
     SUPABASE_URL,
     SUPABASE_ANON_KEY,
@@ -62,8 +62,8 @@ async def main() -> None:
     # Validate LM Studio configuration
     if not LMSTUDIO_BASE_URL:
         raise RuntimeError("LMSTUDIO_BASE_URL is required")
-    if not TELEGRAM_BOT_TOKEN:
-        logger.warning("bot_token_missing", extra={"extra": {"msg": "TELEGRAM_BOT_TOKEN is not set; notifications disabled"}})
+    if not MESSAGE_FUCKERR_TOKEN:
+        logger.warning("bot_token_missing", extra={"extra": {"msg": "MESSAGE_FUCKERR_TOKEN is not set; notifications disabled"}})
 
     if TELEGRAM_STRING_SESSION:
         client = TelegramClient(StringSession(TELEGRAM_STRING_SESSION), api_id=int(TELEGRAM_API_ID), api_hash=TELEGRAM_API_HASH)

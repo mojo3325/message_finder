@@ -24,6 +24,7 @@ COPY tg /app/tg
 COPY utils /app/utils
 COPY utilities /app/utilities
 COPY data /app/data
+COPY warp_chat.py /app/warp_chat.py
 
 # Ensure runtime directories exist
 RUN mkdir -p /app/data /app/results
@@ -39,5 +40,6 @@ ENV LOG_LEVEL=INFO \
     GEMINI_RATE_TPM=250000 \
     GEMINI_RATE_RPD=1000
 
+# Default to message_finder; override CMD in compose for warp_chat
 CMD ["python", "/app/message_finder.py"]
 
