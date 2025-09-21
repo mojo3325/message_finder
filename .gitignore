@@ -2,3 +2,5 @@
 /tg/__pycache__
 *.pyc
 *.pyc
+*.pyc
+/__pycache__
