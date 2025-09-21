@@ -349,6 +349,48 @@ async def _ensure_dialogs_loaded(
     return await _refresh_dialogs_cache(user_id, client=client, limit=limit)
 
 
+async def _get_or_fetch_dialogs(
+    user_id: int,
+    *,
+    client: Optional[Any] = None,
+    limit: Optional[int] = _WARP_DIALOG_FETCH_LIMIT,
+    force_refresh: bool = False,
+) -> list[dict]:
+    """Return cached dialogs or fetch and refresh the cache when needed."""
+
+    cached_dialogs = list(_load_cached_dialogs(user_id))
+
+    if force_refresh:
+        try:
+            refreshed = await _refresh_dialogs_cache(
+                user_id,
+                client=client,
+                limit=limit,
+            )
+        except Exception:
+            refreshed = []
+        if refreshed:
+            return _filter_dialog_entries(refreshed)
+        return cached_dialogs
+
+    if cached_dialogs:
+        return cached_dialogs
+
+    try:
+        refreshed = await _refresh_dialogs_cache(
+            user_id,
+            client=client,
+            limit=limit,
+        )
+    except Exception:
+        refreshed = []
+
+    if refreshed:
+        return _filter_dialog_entries(refreshed)
+
+    return cached_dialogs
+
+
 async def _fetch_private_dialogs_with_preview(
     client: Any,
     limit: Optional[int] = _WARP_DIALOG_FETCH_LIMIT,
@@ -1080,7 +1122,7 @@ async def handle_callback(
                 spinner_task = None
 
             try:
-                dialogs = await _refresh_dialogs_cache(uid_effective)
+                dialogs = await _get_or_fetch_dialogs(uid_effective, force_refresh=True)
             finally:
                 if stop_spinner is not None:
                     stop_spinner.set()
@@ -1605,8 +1647,8 @@ async def handle_callback(
                 body, kb = ui.build_warp_chats_list("Мои приватные чаты", [], 1, 1, session_available=False)
                 await bot_api.bot_edit_message_text(msg_chat_id, msg_id, body, reply_markup=kb)
                 return True
-            dialogs_cached = get_cached_dialogs(uid_effective) or []
-            dialogs = _filter_dialog_entries(dialogs_cached)
+            dialogs_cached = _load_cached_dialogs(uid_effective)
+            dialogs = list(dialogs_cached)
             stop_spinner: Optional[asyncio.Event] = None
             spinner_task: Optional[asyncio.Task[None]] = None
             try:
@@ -1620,8 +1662,9 @@ async def handle_callback(
                 spinner_task = None
 
             try:
-                if not dialogs:
-                    dialogs = await _get_or_fetch_dialogs(uid_effective)
+                dialogs = await _get_or_fetch_dialogs(uid_effective, force_refresh=True)
+                if not dialogs and dialogs_cached:
+                    dialogs = dialogs_cached
             finally:
                 if stop_spinner is not None:
                     stop_spinner.set()
@@ -1669,8 +1712,8 @@ async def handle_callback(
                 body, kb = ui.build_warp_chats_list("Мои приватные чаты", [], 1, 1, session_available=False)
                 await bot_api.bot_edit_message_text(msg_chat_id, msg_id, body, reply_markup=kb)
                 return True
-            dialogs_cached = get_cached_dialogs(u_id) or []
-            dialogs = _filter_dialog_entries(dialogs_cached)
+            dialogs_cached = _load_cached_dialogs(u_id)
+            dialogs = list(dialogs_cached)
             stop_spinner: Optional[asyncio.Event] = None
             spinner_task: Optional[asyncio.Task[None]] = None
             try:
@@ -1684,8 +1727,9 @@ async def handle_callback(
                 spinner_task = None
 
             try:
-                if not dialogs:
-                    dialogs = await _get_or_fetch_dialogs(u_id)
+                dialogs = await _get_or_fetch_dialogs(u_id, force_refresh=True)
+                if not dialogs and dialogs_cached:
+                    dialogs = dialogs_cached
             finally:
                 if stop_spinner is not None:
                     stop_spinner.set()
@@ -1878,11 +1922,10 @@ async def handle_start_payload(
             user_id,
             _WARP_INDEXING_CHATS_HEADER,
         )
-        dialogs_cached = get_cached_dialogs(user_id) or []
-        dialogs = _filter_dialog_entries(dialogs_cached)
+        dialogs_cached = _load_cached_dialogs(user_id)
+        dialogs = list(dialogs_cached)
         if not dialogs:
             dialogs = await _get_or_fetch_dialogs(user_id, force_refresh=True)
-        dialogs = _filter_dialog_entries(dialogs)
         if stop_spinner is not None:
             stop_spinner.set()
             await asyncio.sleep(0)
@@ -2084,69 +2127,16 @@ async def handle_command(
             user_id,
             _WARP_INDEXING_CHATS_HEADER,
         )
-        client = None
+        dialogs_cached = _load_cached_dialogs(user_id)
+        dialogs = list(dialogs_cached)
+        fetch_error: Optional[Exception] = None
         try:
-            client = create_client_from_session(acc.string_session)
-            await client.connect()
-            dialogs = []
-            async for d in client.iter_dialogs(limit=500):
-                try:
-                    if getattr(d, "is_user", False):
-                        entity = d.entity
-                        uid = int(getattr(entity, "id", 0) or 0)
-                        if uid <= 0:
-                            continue
-                        fn = (getattr(entity, "first_name", None) or "").strip()
-                        ln = (getattr(entity, "last_name", None) or "").strip()
-                        uname = getattr(entity, "username", None)
-                        title = (f"{fn} {ln}".strip()) or (f"@{uname}" if uname else str(uid))
-                        last_msg = getattr(d, "message", None)
-                        preview = None
-                        time_str = None
-                        try:
-                            raw = getattr(last_msg, "message", None)
-                            if raw:
-                                preview = _clean_preview(shorten(str(raw)))
-                        except Exception:
-                            preview = None
-                        try:
-                            dt = getattr(last_msg, "date", None)
-                            if dt is not None:
-                                if getattr(dt, "tzinfo", None) is None:
-                                    dt = dt.replace(tzinfo=timezone.utc)
-                                time_str = dt.strftime("%H:%M")
-                        except Exception:
-                            time_str = None
-                        dialogs.append({"chat_id": uid, "title": title, "preview": preview, "time": time_str})
-                except Exception:
-                    continue
-            if stop_spinner is not None:
-                stop_spinner.set()
-                await asyncio.sleep(0)
-            page_size = max(1, int(WARP_LIST_PAGE_SIZE))
-            total_pages = max(1, (len(dialogs) + page_size - 1) // page_size)
-            page = min(max(1, page), total_pages)
-            start = (page - 1) * page_size
-            end = start + page_size
-            page_items = dialogs[start:end]
-            body, kb = ui.build_warp_chats_list("Мои приватные чаты", page_items, page, total_pages)
-            await _deliver_warp_message(user_id, message_id, body, reply_markup=kb)
-            try:
-                logger.info(
-                    "list_open",
-                    extra={"extra": {"user_id": user_id, "total": len(dialogs), "source": "command_list", "page": page}},
-                )
-            except Exception:
-                pass
-        except Exception as e:  # noqa: BLE001
-            logger.error("cmd_list_failed", extra={"extra": {"user_id": user_id, "error": str(e)}})
-            await bot_api.bot_send_html_message(user_id, "Ошибка загрузки списка")
+            if not dialogs:
+                dialogs = await _get_or_fetch_dialogs(user_id, force_refresh=True)
+        except Exception as exc:  # noqa: BLE001
+            fetch_error = exc
+            dialogs = list(dialogs_cached)
         finally:
-            try:
-                if client:
-                    await client.disconnect()
-            except Exception:
-                pass
             if stop_spinner is not None and not stop_spinner.is_set():
                 stop_spinner.set()
                 await asyncio.sleep(0)
@@ -2157,6 +2147,31 @@ async def handle_command(
                     await spinner_task
                 except asyncio.CancelledError:
                     pass
+
+        if fetch_error is not None and not dialogs:
+            logger.error(
+                "cmd_list_failed",
+                extra={"extra": {"user_id": user_id, "error": str(fetch_error)}},
+            )
+            await bot_api.bot_send_html_message(user_id, "Ошибка загрузки списка")
+            return True
+
+        dialogs = _filter_dialog_entries(dialogs)
+        page_size = max(1, int(WARP_LIST_PAGE_SIZE))
+        total_pages = max(1, (len(dialogs) + page_size - 1) // page_size)
+        page = min(max(1, page), total_pages)
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_items = dialogs[start:end]
+        body, kb = ui.build_warp_chats_list("Мои приватные чаты", page_items, page, total_pages)
+        await _deliver_warp_message(user_id, message_id, body, reply_markup=kb)
+        try:
+            logger.info(
+                "list_open",
+                extra={"extra": {"user_id": user_id, "total": len(dialogs), "source": "command_list", "page": page}},
+            )
+        except Exception:
+            pass
         return True
         # No linked account → start linking flow
         st = account_fsm.get(user_id)
