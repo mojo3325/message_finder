@@ -24,6 +24,12 @@ TELEGRAM_STRING_SESSION = (
 )
 TELEGRAM_SESSION_PATH = "session"
 
+# Accounts storage (per-user MTProto sessions)
+ACCOUNTS_FILE = os.getenv("ACCOUNTS_FILE", "data/accounts.json")
+# Secret for encrypting StringSession in accounts storage
+# Prefer setting via env ACCOUNTS_SECRET; fallback to TELEGRAM_API_HASH for dev
+ACCOUNTS_SECRET = os.getenv("ACCOUNTS_SECRET", TELEGRAM_API_HASH)
+
 
 # LM Studio (local OpenAI-compatible) configuration (Docker-aware default)
 LMSTUDIO_BASE_URL = os.getenv(
@@ -50,7 +56,11 @@ GEMINI_REPLY_MODEL = "gemini-2.5-flash"
 
 
 # Bot API for notifications
-TELEGRAM_BOT_TOKEN = "REDACTED_TELEGRAM_BOT_TOKEN"
+# message_fuckerr_bot
+MESSAGE_FUCKERR_TOKEN = "REDACTED_TELEGRAM_BOT_TOKEN"
+# warp_chat_bot
+WARP_CHAT_BOT_TOKEN = "REDACTED_TELEGRAM_BOT_TOKEN"
+WARP_BOT_USERNAME = os.getenv("WARP_BOT_USERNAME", "warp_chat_bot")
 
 
 GROQ_API_KEY = "REDACTED_GROQ_KEY"
@@ -93,5 +103,15 @@ SUPABASE_ANON_KEY = os.getenv(
     "SUPABASE_ANON_KEY",
     "REDACTED_JWT",
 )
+# Warp Chat configuration
+# Context messages to index for generation (N)
+INDEX_CONTEXT_LIMIT = int(os.getenv("INDEX_CONTEXT_LIMIT", "40"))
+# Alias for clarity in Warp Chat code
+WARP_CONTEXT_LIMIT = int(os.getenv("WARP_CONTEXT_LIMIT", str(INDEX_CONTEXT_LIMIT)))
+# Number of last messages to show in miniature
+WARP_MINIATURE_LAST = int(os.getenv("WARP_MINIATURE_LAST", "4"))
+# Page size for private chats list
+WARP_LIST_PAGE_SIZE = int(os.getenv("WARP_LIST_PAGE_SIZE", "10"))
+
 
 

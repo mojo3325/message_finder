@@ -1,12 +1,12 @@
 from typing import Any, Optional
 
 from logging_config import logger
-from config import TELEGRAM_BOT_TOKEN
+from config import MESSAGE_FUCKERR_TOKEN
 from services.clients import get_http_client
 from utils.retry import send_with_retries
 from tg.context import escape_html
 from tg.ui_state import reply_ui_store
-from tg import bot_api
+from tg import ui
 from core.types import ClassificationResult
 
 
@@ -23,15 +23,16 @@ async def notifier_send(
     subscriber_store: Any,
     bot_token: Optional[str] = None,
 ) -> None:
-    token = bot_token or TELEGRAM_BOT_TOKEN
+    token = bot_token or MESSAGE_FUCKERR_TOKEN
     if not token:
-        logger.warning("bot_token_missing", extra={"extra": {"msg": "TELEGRAM_BOT_TOKEN is not set"}})
+        logger.warning("bot_token_missing", extra={"extra": {"msg": "MESSAGE_FUCKERR_TOKEN is not set"}})
         return
 
     full_name = " ".join(
         filter(None, [getattr(user, "first_name", None), getattr(user, "last_name", None)])
     ) or "отсутствует"
     username = f"@{getattr(user, 'username', '')}" if getattr(user, "username", None) else "отсутствует"
+    raw_username = getattr(user, "username", None)
     chat_title = getattr(chat, "title", None) or getattr(chat, "username", None) or chat.__class__.__name__
 
     underlined = f"<u>{escape_html(text)}</u>"
@@ -58,6 +59,13 @@ async def notifier_send(
         author_user_id = None
 
     try:
+        author_access_hash = (
+            int(getattr(user, "access_hash", 0)) if user is not None and getattr(user, "access_hash", None) is not None else None
+        )
+    except Exception:
+        author_access_hash = None
+
+    try:
         source_chat_id = int(getattr(chat, "id", 0) or 0)
     except Exception:
         source_chat_id = None
@@ -70,16 +78,10 @@ async def notifier_send(
         classification_result=classification_result,
         author_user_id=author_user_id,
         source_chat_id=source_chat_id,
+        author_username=str(raw_username) if raw_username else None,
+        author_access_hash=author_access_hash,
     )
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "👎", "callback_data": f"dislike:{sid}"},
-                {"text": "✨", "callback_data": f"gen:{sid}"},
-                {"text": "👨🏻‍🦰", "callback_data": f"portrait:{sid}"},
-            ]
-        ]
-    }
+    keyboard = ui.build_feedback_keyboard(sid)
 
     http_client = get_http_client()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -138,5 +140,3 @@ async def notifier_send(
         return resp
 
     await send_with_retries(_post)
-
-

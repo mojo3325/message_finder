@@ -3,7 +3,7 @@ from typing import Any, List, Optional, Tuple
 import re
 
 from telethon import events, TelegramClient
-from telethon.tl.types import Channel, PeerUser, PeerChannel, PeerChat
+from telethon.tl.types import Channel, InputPeerUser, PeerUser, PeerChannel, PeerChat
 
 from logging_config import logger
 
@@ -12,42 +12,100 @@ def escape_html(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+_ALLOWED_HTML_TAGS: tuple[str, ...] = ("b", "i", "u")
+_PLACEHOLDER_TEMPLATE = "__TG_TAG_{idx}__"
+
+
 def sanitize_telegram_html(raw_html: str) -> str:
     """Normalize LLM output to Telegram HTML subset.
 
-    - Replace <br>, <br/>, <br /> with newlines
-    - Strip unsupported tags, keep only <b>, <i>, <u>
-    - Remove attributes from allowed tags
+    The sanitizer keeps only <b>, <i>, <u> tags, removes attributes, closes
+    unbalanced tags, and escapes every other HTML construct so Telegram can
+    parse the result safely.
     """
+
     if not raw_html:
         return ""
 
     text = raw_html
 
-    # Normalize common line-break tags to newlines
+    # Normalise newlines first so later escaping keeps structure readable.
+    text = text.replace("\r", "")
     text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
-    # Treat common block containers as line breaks
     text = re.sub(r"<\s*/?\s*(?:div|p)\s*>", "\n", text, flags=re.IGNORECASE)
 
-    # Strip attributes from allowed tags
-    def _strip_attrs(match: re.Match[str]) -> str:
-        # match groups: 1 = optional '/', 2 = tag name
-        slash = match.group(1) or ""
+    placeholders: list[tuple[str, bool, str]] = []
+
+    def _extract_allowed(match: re.Match[str]) -> str:
+        slash = bool(match.group(1))
         tag = (match.group(2) or "").lower()
-        return f"<{slash}{tag}>"
+        idx = len(placeholders)
+        placeholder = _PLACEHOLDER_TEMPLATE.format(idx=idx)
+        placeholders.append((placeholder, slash, tag))
+        return placeholder
 
-    text = re.sub(r"<\s*(/?)\s*(b|i|u)(?:\s+[^>]*?)?>", _strip_attrs, text, flags=re.IGNORECASE)
+    # Extract allowed tags (with attributes stripped) and remember ordering.
+    text = re.sub(
+        r"<\s*(/?)\s*(b|i|u)(?:\s+[^>]*?)?>",
+        _extract_allowed,
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    # Remove any other tags not in the allowed list
-    text = re.sub(r"<\s*/?\s*(?!b\b|i\b|u\b)[a-z0-9]+(?:\s+[^>]*?)?>", "", text, flags=re.IGNORECASE)
+    # Drop any other tags entirely.
+    text = re.sub(r"<[^>]+>", "", text)
 
-    # Remove any accidental self-closing allowed tags like <b/> that Telegram rejects
-    text = re.sub(r"<\s*(b|i|u)\s*/\s*>", "", text, flags=re.IGNORECASE)
+    # Escape the remainder so raw angle brackets do not break Telegram parsing.
+    safe = html.escape(text, quote=False)
 
-    # Collapse excessive blank lines
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Collapse excessive blank lines after escaping to keep layout compact.
+    safe = re.sub(r"\n{3,}", "\n\n", safe)
 
-    return text.strip()
+    # Decide which placeholders can be safely re-inserted while keeping the
+    # HTML balanced. Unmatched tags are dropped.
+    open_stack: list[tuple[str, str]] = []
+    replacements: dict[str, str] = {}
+
+    for placeholder, is_closing, tag in placeholders:
+        if tag not in _ALLOWED_HTML_TAGS:
+            replacements[placeholder] = ""
+            continue
+        if not is_closing:
+            open_stack.append((tag, placeholder))
+            replacements[placeholder] = f"<{tag}>"
+            continue
+
+        # Closing tag: find the nearest matching open tag.
+        match_idx = None
+        for idx in range(len(open_stack) - 1, -1, -1):
+            open_tag, _ = open_stack[idx]
+            if open_tag == tag:
+                match_idx = idx
+                break
+
+        if match_idx is None:
+            replacements[placeholder] = ""
+            continue
+
+        # Drop any still-open tags stacked above the match – their markup would be unbalanced.
+        for extra_tag, extra_placeholder in open_stack[match_idx + 1 :]:
+            replacements[extra_placeholder] = ""
+
+        # Pop the matched tag and anything above it.
+        open_stack = open_stack[:match_idx]
+        replacements[placeholder] = f"</{tag}>"
+
+    # Any unmatched opening tags are removed to avoid dangling markup.
+    for _, placeholder in open_stack:
+        replacements[placeholder] = ""
+
+    for placeholder, replacement in replacements.items():
+        safe = safe.replace(placeholder, replacement)
+
+    # Remove any placeholders that were never assigned (should not happen but safe-guard).
+    safe = re.sub(r"__TG_TAG_\d+__", "", safe)
+
+    return safe.strip()
 
 def build_internal_chat_c_id(chat_id: int) -> Optional[str]:
     raw = str(abs(chat_id))
@@ -152,6 +210,7 @@ async def fetch_author_texts_from_history(
     *,
     limit_msgs: int = 1000,
     max_collect: int = 200,
+    author_access_hash: Optional[int] = None,
 ) -> List[str]:
     """Fetch up to max_collect non-empty text messages from a specific author in a chat history.
 
@@ -163,9 +222,20 @@ async def fetch_author_texts_from_history(
         return []
 
     texts: List[str] = []
+    from_user_param: Any = int(author_user_id)
+    if author_access_hash is not None:
+        try:
+            from_user_param = InputPeerUser(int(author_user_id), int(author_access_hash))
+            await client.get_input_entity(from_user_param)
+        except Exception:
+            from_user_param = int(author_user_id)
     try:
         # Telethon yields newest-first; we'll reverse later
-        async for msg in client.iter_messages(entity=chat_id, limit=limit_msgs, from_user=author_user_id):
+        async for msg in client.iter_messages(
+            entity=chat_id,
+            limit=limit_msgs,
+            from_user=from_user_param,
+        ):
             try:
                 raw = getattr(msg, "message", None)
             except Exception:  # noqa: BLE001
@@ -199,6 +269,7 @@ async def fetch_author_messages_with_meta_from_history(
     *,
     limit_msgs: int = 1000,
     max_collect: int = 200,
+    author_access_hash: Optional[int] = None,
 ) -> List[dict]:
     """Fetch up to max_collect messages with metadata for a specific author.
 
@@ -211,8 +282,19 @@ async def fetch_author_messages_with_meta_from_history(
         return []
 
     items: List[dict] = []
+    from_user_param: Any = int(author_user_id)
+    if author_access_hash is not None:
+        try:
+            from_user_param = InputPeerUser(int(author_user_id), int(author_access_hash))
+            await client.get_input_entity(from_user_param)
+        except Exception:
+            from_user_param = int(author_user_id)
     try:
-        async for msg in client.iter_messages(entity=chat_id, limit=limit_msgs, from_user=author_user_id):
+        async for msg in client.iter_messages(
+            entity=chat_id,
+            limit=limit_msgs,
+            from_user=from_user_param,
+        ):
             try:
                 raw = getattr(msg, "message", None)
             except Exception:  # noqa: BLE001
@@ -254,4 +336,3 @@ async def fetch_author_messages_with_meta_from_history(
         return []
     items.reverse()
     return items
-

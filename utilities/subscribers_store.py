@@ -8,7 +8,7 @@ logger = logging.getLogger("supabase_store")
 
 
 class SupabaseSubscriberStore:
-    def __init__(self, supabase_url: str, api_key: str, timeout_s: float = 10.0) -> None:
+    def __init__(self, supabase_url: str, api_key: str, timeout_s: float = 10.0, offset_key: str = "bot_last_update_id") -> None:
         base = (supabase_url or "").rstrip("/")
         if not base:
             raise ValueError("SUPABASE_URL is required")
@@ -22,7 +22,7 @@ class SupabaseSubscriberStore:
         # Table names/keys
         self._subscribers_table = "subscribers"
         self._kv_table = "kv_store"
-        self._offset_key = "bot_last_update_id"
+        self._offset_key = offset_key or "bot_last_update_id"
         # Store for classified messages (for later summarization/portraits)
         self._messages_table = "classified_messages"
 
