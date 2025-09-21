@@ -176,14 +176,19 @@ def build_warp_miniature(
     for m in messages:
         direction = str(m.get("direction") or "").lower()
         author = escape_html(str(m.get("author") or ""))
-        text = escape_html(str(m.get("text") or ""))
-        if not text:
+        raw_text = str(m.get("text") or "")
+        text_lines_raw = raw_text.splitlines()
+        if not text_lines_raw:
+            text_lines_raw = [raw_text] if raw_text else []
+        text_lines = [escape_html(line) for line in text_lines_raw]
+        if not text_lines:
             continue
         if direction == "out":
             body_lines.append(f"→ <b>{author}:</b>")
         else:
             body_lines.append(f"← {author}:")
-        body_lines.append("   " + text)
+        for line in text_lines:
+            body_lines.append("   " + line if line else "   ")
         body_lines.append("")
 
     if generated_reply:
