@@ -1,85 +1,262 @@
+from __future__ import annotations
+
 import re
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from const import DIALOGUE_PROMPT
-from core.rate_limiter import estimate_prompt_tokens
-from logging_config import logger
 from config import GEMINI_RATE_RPD, GEMINI_REPLY_MODEL
+from const import DIALOGUE_PROMPT
+from core.rate_limiter import estimate_prompt_tokens, gemini_rate_limiter
+from logging_config import logger
 from services.clients import get_gemini_client
-from services.errors import is_gemini_quota_exhausted_error, is_gemini_transient_or_rate_error
-from core.rate_limiter import gemini_rate_limiter
+from services.errors import (
+    is_gemini_quota_exhausted_error,
+    is_gemini_transient_or_rate_error,
+)
+
+
+StructuredContextEntry = Dict[str, Any]
+ReplyContext = Union[str, Dict[str, Any], Sequence[StructuredContextEntry]]
 
 
 def normalize_short_reply(raw: str) -> str:
-    # Keep model output intact; only trim whitespace and surrounding quotes.
+    """Normalize model output by trimming whitespace and redundant quotes."""
     if not raw:
         return ""
 
     text = (raw or "").strip()
 
-    # Drop surrounding single/double quotes if the whole reply is quoted
     if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
         text = text[1:-1].strip()
 
-    # Collapse excessive internal spaces but preserve punctuation and sentence boundaries
     text = re.sub(r"[\t \f\v]+", " ", text).strip()
 
     return text
 
 
-def generate_reply_sync(message_text: str, context: Optional[str] = None, *, is_from_owner: bool = False) -> str:
+def _parse_reply_context(context: Optional[ReplyContext]) -> Tuple[str, List[StructuredContextEntry]]:
+    context_text = ""
+    entries: List[StructuredContextEntry] = []
+    if context is None:
+        return context_text, entries
+    if isinstance(context, str):
+        return context.strip(), entries
+    if isinstance(context, dict):
+        context_text = str(context.get("text") or "").strip()
+        raw_entries = context.get("entries")
+        if isinstance(raw_entries, (list, tuple)):
+            for entry in raw_entries:
+                if isinstance(entry, dict):
+                    entries.append(entry)
+        return context_text, entries
+    if isinstance(context, (list, tuple)):
+        for entry in context:
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return context_text, entries
+
+
+def _format_context_entry(entry: StructuredContextEntry) -> str:
+    role_raw = entry.get("role")
+    role = str(role_raw).strip() if isinstance(role_raw, str) else str(role_raw or "USER").strip() or "USER"
+
+    identifier_raw = entry.get("identifier")
+    if isinstance(identifier_raw, str):
+        identifier = identifier_raw.strip()
+    elif identifier_raw is None:
+        identifier = ""
+    else:
+        identifier = str(identifier_raw).strip()
+
+    text_raw = entry.get("text")
+    message_text = str(text_raw).strip() if isinstance(text_raw, str) else ""
+
+    prefix = role
+    if identifier:
+        prefix = f"{role} {identifier}"
+
+    return f"{prefix}: {message_text}" if message_text else f"{prefix}:"
+
+
+def _describe_media_for_log(media: Dict[str, Any]) -> str:
+    label_source = media.get("display") or media.get("context") or media.get("type") or "media"
+    label = str(label_source).strip() if isinstance(label_source, str) else str(label_source)
+
+    extras: List[str] = []
+    for key in ("format", "duration", "subtype"):
+        value = media.get(key)
+        if isinstance(value, str) and value.strip():
+            extras.append(f"{key}={value.strip()}")
+
+    if extras:
+        return f"[MEDIA {label} ({', '.join(extras)})]"
+    return f"[MEDIA {label}]"
+
+
+def _infer_format_from_mime(mime: Optional[str]) -> Optional[str]:
+    if not isinstance(mime, str):
+        return None
+    parts = mime.split("/", 1)
+    if len(parts) != 2:
+        return None
+    subtype = parts[1].strip().lower()
+    if not subtype:
+        return None
+    if subtype == "jpeg":
+        return "jpg"
+    if "+" in subtype:
+        subtype = subtype.split("+", 1)[0]
+    return subtype or None
+
+
+def _media_to_content_parts(media: Dict[str, Any]) -> List[Dict[str, Any]]:
+    parts: List[Dict[str, Any]] = []
+    data_raw = media.get("data")
+    if not isinstance(data_raw, str) or not data_raw.strip():
+        return parts
+    data = data_raw.strip()
+
+    media_type = str(media.get("type") or "").lower()
+
+    format_hint_raw = media.get("format")
+    format_hint = str(format_hint_raw).strip().lower() if isinstance(format_hint_raw, str) else ""
+
+    mime_raw = media.get("mime_type")
+    mime_type = str(mime_raw).strip() if isinstance(mime_raw, str) else ""
+
+    if not format_hint:
+        inferred = _infer_format_from_mime(mime_type)
+        if inferred:
+            format_hint = inferred
+
+    if media_type in {"photo", "image"}:
+        mime_to_use = mime_type or "image/jpeg"
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime_to_use};base64,{data}"}})
+    elif media_type in {"voice", "audio"}:
+        fmt = format_hint or "ogg"
+        parts.append({"type": "input_audio", "audio": {"data": data, "format": fmt}})
+    elif media_type == "video":
+        fmt = format_hint or "mp4"
+        parts.append({"type": "input_video", "video": {"data": data, "format": fmt}})
+
+    return parts
+
+
+def _estimate_context_tokens(context_text: str, entries: Sequence[StructuredContextEntry]) -> int:
+    text_for_estimation = context_text.strip()
+    if not text_for_estimation and entries:
+        rendered = [
+            _format_context_entry(entry)
+            for entry in entries
+            if isinstance(entry, dict)
+        ]
+        text_for_estimation = "\n".join(line for line in rendered if line)
+    if not text_for_estimation:
+        return 0
+    return max(1, len(text_for_estimation) // 4)
+
+
+def generate_reply_sync(
+    message_text: str,
+    context: Optional[ReplyContext] = None,
+    *,
+    is_from_owner: bool = False,
+) -> str:
     safe_text = (message_text or "").strip()
-    has_context = bool(context and context.strip())
+    context_text, context_entries = _parse_reply_context(context)
+    has_context = bool(context_text) or bool(context_entries)
+
     if not safe_text and not has_context:
         return "Можешь уточнить, что именно хочешь сделать? Я помогу."
 
     attempts = 0
     while True:
         try:
-            user_content_parts: List[str] = []
-            # Explicit role legend to disambiguate who wrote what
-            user_content_parts.append(
-                "\n".join([
+            instructions = "\n".join(
+                [
                     "ROLES:",
                     "OWNER — владелец аккаунта (я)",
                     "USER — собеседник/другой участник чата",
                     "Если говорящий не указан явно — считай это USER",
-                ])
+                ]
             )
-            if has_context:
-                user_content_parts.append(f"CHAT_CONTEXT (chronological):\n{context.strip()}")
-            if safe_text:
-                sender_label = "OWNER" if is_from_owner else "USER"
-                user_content_parts.append(f"CURRENT_MESSAGE_FROM: {sender_label}\n{safe_text}")
-            else:
-                # Context-only mode: request a short helpful reply suggestion based on context
-                user_content_parts.append("")
 
-            user_content = "\n\n".join(user_content_parts)
+            user_content: List[Dict[str, Any]] = [{"type": "text", "text": instructions}]
+            log_lines: List[str] = [instructions]
+
+            if context_entries:
+                user_content.append({"type": "text", "text": "CHAT_CONTEXT (chronological):"})
+                log_lines.append("CHAT_CONTEXT (chronological):")
+                for entry in context_entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_line = _format_context_entry(entry)
+                    if entry_line:
+                        user_content.append({"type": "text", "text": entry_line})
+                        log_lines.append(entry_line)
+                    media_list = entry.get("media")
+                    if isinstance(media_list, (list, tuple)):
+                        for media in media_list:
+                            if not isinstance(media, dict):
+                                continue
+                            display_candidate = media.get("display") or media.get("context")
+                            if isinstance(display_candidate, str) and display_candidate.strip():
+                                media_text = display_candidate.strip()
+                            else:
+                                media_text = _describe_media_for_log(media)
+                            user_content.append({"type": "text", "text": media_text})
+                            log_lines.append(media_text)
+                            for part in _media_to_content_parts(media):
+                                user_content.append(part)
+            elif context_text:
+                context_segment = f"CHAT_CONTEXT (chronological):\n{context_text}"
+                user_content.append({"type": "text", "text": context_segment})
+                log_lines.append(context_segment)
+
+            sender_label = "OWNER" if is_from_owner else "USER"
+            if safe_text:
+                current_segment = f"CURRENT_MESSAGE_FROM: {sender_label}\n{safe_text}"
+            else:
+                current_segment = f"CURRENT_MESSAGE_FROM: {sender_label}"
+            user_content.append({"type": "text", "text": current_segment})
+            log_lines.append(current_segment)
+
             client = get_gemini_client()
+
             est = estimate_prompt_tokens(safe_text)
-            if context:
-                est += max(1, len(context) // 4)
+            est += _estimate_context_tokens(context_text, context_entries)
             est += 64
             try:
                 gemini_rate_limiter.acquire_sync(est, rpd=GEMINI_RATE_RPD)
             except Exception:
                 time.sleep(0.2)
 
-            logger.info(f"replier prompt: {DIALOGUE_PROMPT}\n{user_content}", extra={"plain": True})
-
+            log_prompt = "\n".join(log_lines)
+            logger.info(
+                f"replier prompt: {DIALOGUE_PROMPT}\n{log_prompt}",
+                extra={"plain": True},
+            )
 
             cc = client.chat.completions.create(
                 model=GEMINI_REPLY_MODEL,
                 reasoning_effort="high",
                 messages=[
-                    {"role": "system", "content": DIALOGUE_PROMPT},
-                    {"role": "user", "content": user_content}
-                ]
+                    {"role": "system", "content": [{"type": "text", "text": DIALOGUE_PROMPT}]},
+                    {"role": "user", "content": user_content},
+                ],
             )
 
-            raw = (cc.choices[0].message.content or "").strip()
+            message_content = cc.choices[0].message.content
+            if isinstance(message_content, list):
+                raw_parts = [
+                    part.get("text", "")
+                    for part in message_content
+                    if isinstance(part, dict)
+                ]
+                raw = "\n".join(part for part in raw_parts if part).strip()
+            else:
+                raw = (message_content or "").strip()
+
             text = normalize_short_reply(raw)
             logger.info(f"replier output:\n{text}", extra={"plain": True})
             return text or "Давай уточним цель в одном предложении."
@@ -98,16 +275,25 @@ def generate_reply_sync(message_text: str, context: Optional[str] = None, *, is_
             time.sleep(min(2 ** attempts, 10))
 
 
-async def generate_reply(message_text: str, context: Optional[str] = None, *, is_from_owner: bool = False) -> str:
+async def generate_reply(
+    message_text: str,
+    context: Optional[ReplyContext] = None,
+    *,
+    is_from_owner: bool = False,
+) -> str:
     import asyncio
 
+    context_text, context_entries = _parse_reply_context(context)
+
     estimated = estimate_prompt_tokens(message_text)
-    if context:
-        estimated += max(1, len(context) // 4)
+    estimated += _estimate_context_tokens(context_text, context_entries)
     estimated += 48
-    from core.rate_limiter import gemini_rate_limiter as _gemini_rate_limiter
 
-    await _gemini_rate_limiter.acquire(estimated)
-    return await asyncio.to_thread(generate_reply_sync, message_text, context, is_from_owner=is_from_owner)
-
+    await gemini_rate_limiter.acquire(estimated)
+    return await asyncio.to_thread(
+        generate_reply_sync,
+        message_text,
+        context,
+        is_from_owner=is_from_owner,
+    )
 

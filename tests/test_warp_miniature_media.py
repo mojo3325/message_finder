@@ -38,9 +38,9 @@ def test_collect_media_descriptions_photo_and_voice():
     descriptions = _collect_media_descriptions(msg)
     displays = {desc["display"] for desc in descriptions}
     contexts = {desc["context"] for desc in descriptions}
-    assert any(display.startswith("🖼 Фото") for display in displays)
+    assert any(display.startswith("🖼 изображение") for display in displays)
     assert any(display.startswith("🎙 Голосовое сообщение 0:17") for display in displays)
-    assert any(context.startswith("[Фото") for context in contexts)
+    assert "[Фото: изображение.jpg]" in contexts
     assert "[Голосовое сообщение 0:17]" in contexts
 
 
@@ -56,8 +56,9 @@ def test_collect_media_descriptions_document_with_filename():
     assert len(descriptions) == 1
     entry = descriptions[0]
     assert entry["media_type"] == "document"
-    assert "report.pdf" in entry["display"]
-    assert entry["context"].startswith("[Документ")
+    assert entry["display"].startswith("📄 документ")
+    assert "report.pdf" not in entry["display"]
+    assert entry["context"] == "[Документ: документ.pdf]"
     assert entry["info"]["format"] == "PDF"
     assert entry["info"]["name"] == "report.pdf"
 
@@ -66,9 +67,9 @@ def test_build_message_preview_lines_combines_text_and_media():
     photo_msg = _make_message(message="Привет", photo=object())
     lines, context = _build_message_preview_lines(photo_msg)
     assert "Привет" in lines
-    assert any(line.startswith("🖼 Фото") for line in lines)
+    assert any(line.startswith("🖼 изображение") for line in lines)
     assert context is not None and context.startswith("Привет")
-    assert "[Фото" in context
+    assert "[Фото: изображение" in context
 
 
 def test_build_message_preview_lines_media_only_voice():
@@ -82,7 +83,7 @@ def test_build_message_preview_lines_media_only_voice():
 def test_build_dialog_preview_text_includes_media_placeholders():
     msg = _make_message(photo=object())
     preview = _build_dialog_preview_text(msg)
-    assert preview is not None and preview.startswith("🖼 Фото")
+    assert preview is not None and preview.startswith("🖼 изображение")
 
 
 def test_build_dialog_preview_text_combines_text_and_media():
@@ -139,11 +140,11 @@ def test_build_miniature_message_entry_text_and_media_outgoing():
     assert entry["author"] == "Вы"
     assert entry["text"] == "Привет"
     assert entry["text_lines"] == ["Привет"]
-    assert any(line.startswith("🖼 Фото") for line in entry["media_lines"])
+    assert any(line.startswith("🖼 изображение") for line in entry["media_lines"])
     assert entry["has_media"] is True
     assert entry["media_type"] == "photo"
     assert entry["media_info"] is None
-    assert any(line.startswith("🖼 Фото") for line in entry["preview_lines"][1:])
+    assert any(line.startswith("🖼 изображение") for line in entry["preview_lines"][1:])
 
 
 def test_build_warp_miniature_renders_multiline_messages():
@@ -153,8 +154,8 @@ def test_build_warp_miniature_renders_multiline_messages():
             "author": "Аня",
             "text": "Привет",
             "text_lines": ["Привет"],
-            "media_lines": ["🖼 Фото"],
-            "preview_lines": ["Привет", "🖼 Фото"],
+            "media_lines": ["🖼 изображение"],
+            "preview_lines": ["Привет", "🖼 изображение"],
             "has_media": True,
         },
         {
@@ -169,6 +170,6 @@ def test_build_warp_miniature_renders_multiline_messages():
     ]
     body, _ = build_warp_miniature("Чат", "12:00", messages, chat_id=123)
     assert "Привет" in body
-    assert "🖼 Фото" in body
+    assert "🖼 изображение" in body
     assert "🎙 Голосовое сообщение 0:05" in body
-    assert "   🖼 Фото" in body
+    assert "   🖼 изображение" in body
