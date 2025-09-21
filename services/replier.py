@@ -109,6 +109,28 @@ def _infer_format_from_mime(mime: Optional[str]) -> Optional[str]:
     return subtype or None
 
 
+def _normalize_audio_format_hint(raw: Optional[str]) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip().lower()
+    if not value:
+        return None
+
+    aliases = {
+        "mpeg": "mp3",
+        "mpga": "mp3",
+        "mp2": "mp3",
+        "mp1": "mp3",
+        "mpega": "mp3",
+        "wave": "wav",
+        "x-wav": "wav",
+        "x-pn-wav": "wav",
+        "oga": "ogg",
+        "opus": "ogg",
+    }
+    return aliases.get(value, value)
+
+
 def _media_to_content_parts(media: Dict[str, Any]) -> List[Dict[str, Any]]:
     parts: List[Dict[str, Any]] = []
     data_raw = media.get("data")
@@ -133,11 +155,18 @@ def _media_to_content_parts(media: Dict[str, Any]) -> List[Dict[str, Any]]:
         mime_to_use = mime_type or "image/jpeg"
         parts.append({"type": "image_url", "image_url": {"url": f"data:{mime_to_use};base64,{data}"}})
     elif media_type in {"voice", "audio"}:
-        fmt = format_hint or "ogg"
-        parts.append({"type": "input_audio", "audio": {"data": data, "format": fmt}})
+        fmt_candidate = format_hint or _infer_format_from_mime(mime_type)
+        fmt = _normalize_audio_format_hint(fmt_candidate)
+        if fmt in {"mp3", "wav"}:
+            parts.append({"type": "input_audio", "input_audio": {"data": data, "format": fmt}})
+        else:
+            logger.warning(
+                "Skipping audio attachment with unsupported format",
+                extra={"format": fmt_candidate or "unknown", "media_type": media_type},
+            )
     elif media_type == "video":
         fmt = format_hint or "mp4"
-        parts.append({"type": "input_video", "video": {"data": data, "format": fmt}})
+        parts.append({"type": "input_video", "input_video": {"data": data, "format": fmt}})
 
     return parts
 
@@ -206,6 +235,14 @@ def generate_reply_sync(
                                 media_text = _describe_media_for_log(media)
                             user_content.append({"type": "text", "text": media_text})
                             log_lines.append(media_text)
+                            analysis = media.get("analysis")
+                            if isinstance(analysis, dict):
+                                label = analysis.get("label")
+                                text_val = analysis.get("text")
+                                if isinstance(label, str) and label.strip() and isinstance(text_val, str) and text_val.strip():
+                                    snippet = f"{label.strip()}: {text_val.strip()}"
+                                    user_content.append({"type": "text", "text": snippet})
+                                    log_lines.append(snippet)
                             for part in _media_to_content_parts(media):
                                 user_content.append(part)
             elif context_text:

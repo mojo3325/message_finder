@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
+import shutil
+import subprocess
+import tempfile
 import unicodedata
 from datetime import timezone
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
@@ -17,6 +21,7 @@ from services.drafts import drafts_store
 from services.feedback import save_feedback
 from services.user_sessions import create_client_from_session
 import services.replier as replier_service
+import services.media_annotator as media_annotator
 
 from tg import bot_api, ui
 from utilities.accounts_store import get_user_account
@@ -56,6 +61,25 @@ _WARP_DIALOG_ENTRY_VERSION: int = 3
 _WARP_DIALOG_FETCH_LIMIT: Optional[int] = 500
 
 _WARP_EXCLUDED_USER_IDS: tuple[int, ...] = (777000,)
+
+_SUPPORTED_AUDIO_FORMATS = {"mp3", "wav"}
+_AUDIO_FORMAT_ALIASES = {
+    "mpeg": "mp3",
+    "mpga": "mp3",
+    "mp2": "mp3",
+    "mp1": "mp3",
+    "mpega": "mp3",
+    "wave": "wav",
+    "x-wav": "wav",
+    "x-pn-wav": "wav",
+    "oga": "ogg",
+    "opus": "ogg",
+    "spx": "ogg",
+}
+
+_FFMPEG_PATH_CACHE: Optional[str] = None
+_FFMPEG_PATH_PROBED: bool = False
+_FFMPEG_MISSING_LOGGED: bool = False
 
 
 def _format_media_duration(raw_duration: Any) -> Optional[str]:
@@ -192,6 +216,176 @@ def _normalize_format_hint(raw: Any) -> Optional[str]:
         if cleaned:
             return cleaned.lower()
     return None
+
+
+def _normalize_audio_format_hint(raw: Optional[str]) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip().lower()
+    if not value:
+        return None
+    return _AUDIO_FORMAT_ALIASES.get(value, value)
+
+
+def _get_ffmpeg_path() -> Optional[str]:
+    global _FFMPEG_PATH_CACHE, _FFMPEG_PATH_PROBED
+    if not _FFMPEG_PATH_PROBED:
+        _FFMPEG_PATH_CACHE = shutil.which("ffmpeg")
+        _FFMPEG_PATH_PROBED = True
+    return _FFMPEG_PATH_CACHE
+
+
+def _transcode_audio_bytes_to_wav_sync(data: bytes, source_format: Optional[str]) -> Optional[bytes]:
+    global _FFMPEG_MISSING_LOGGED
+    ffmpeg_path = _get_ffmpeg_path()
+    if not ffmpeg_path:
+        if not _FFMPEG_MISSING_LOGGED:
+            logger.warning(
+                "ffmpeg binary not found; voice messages will be sent without audio payload",
+                extra={"needs_ffmpeg": True},
+            )
+            _FFMPEG_MISSING_LOGGED = True
+        return None
+
+    suffix = f".{source_format}" if source_format else ".bin"
+    src_path: Optional[str] = None
+    dst_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as src_file:
+            src_file.write(data)
+            src_file.flush()
+            src_path = src_file.name
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as dst_file:
+            dst_path = dst_file.name
+
+        proc = subprocess.run(
+            [ffmpeg_path, "-y", "-i", src_path, "-ar", "16000", "-ac", "1", dst_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if proc.returncode != 0:
+            stderr_text = proc.stderr.decode("utf-8", "ignore")
+            logger.warning(
+                "ffmpeg failed to transcode audio payload",
+                extra={"returncode": proc.returncode, "stderr": stderr_text[:400]},
+            )
+            return None
+
+        with open(dst_path, "rb") as converted_file:
+            converted = converted_file.read()
+        if not converted:
+            logger.warning("ffmpeg produced empty audio payload for voice message")
+            return None
+        return converted
+    finally:
+        for path in (src_path, dst_path):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def _ensure_supported_audio_bytes(
+    data: bytes,
+    format_hint: Optional[str],
+    mime_type: Optional[str],
+) -> Optional[tuple[bytes, str, str]]:
+    normalized_format = _normalize_audio_format_hint(format_hint)
+    if not normalized_format and mime_type:
+        normalized_format = _normalize_audio_format_hint(_infer_format_from_mime(mime_type))
+
+    if normalized_format in _SUPPORTED_AUDIO_FORMATS:
+        target_mime = "audio/mpeg" if normalized_format == "mp3" else "audio/wav"
+        return data, normalized_format, target_mime
+
+    converted = await asyncio.to_thread(
+        _transcode_audio_bytes_to_wav_sync,
+        data,
+        normalized_format,
+    )
+    if not converted:
+        logger.warning(
+            "Skipping audio attachment with unsupported format for model context",
+            extra={
+                "format": normalized_format or format_hint or "unknown",
+                "mime_type": mime_type,
+            },
+        )
+        return None
+
+    return converted, "wav", "audio/wav"
+
+
+async def _generate_media_analysis(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    media_type = str(payload.get("type") or "").lower()
+    data = payload.get("data")
+    if not isinstance(data, str) or not data.strip():
+        return None
+
+    async def _call(func: Callable[..., Optional[str]], *args: Any) -> Optional[str]:
+        result = await asyncio.to_thread(func, *args)
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        return None
+
+    try:
+        if media_type in {"voice", "audio"}:
+            fmt = str(payload.get("format") or "").strip()
+            if not fmt:
+                return None
+            transcript = await _call(media_annotator.transcribe_audio_base64, data, fmt)
+            if transcript:
+                return {"label": "Транскрипция", "text": transcript}
+        elif media_type == "photo":
+            mime = payload.get("mime_type")
+            mime_val = str(mime).strip() if isinstance(mime, str) else ""
+            if not mime_val:
+                fmt = str(payload.get("format") or "").strip()
+                if fmt:
+                    mime_val = f"image/{fmt.lower()}"
+            if not mime_val:
+                return None
+            description = await _call(media_annotator.describe_image_base64, data, mime_val)
+            if description:
+                return {"label": "Описание", "text": description}
+        elif media_type == "video":
+            fmt = str(payload.get("format") or "").strip() or "mp4"
+            summary = await _call(media_annotator.summarize_video_base64, data, fmt)
+            if summary:
+                return {"label": "Описание", "text": summary}
+    except Exception:
+        logger.exception("media analysis generation failed", extra={"media_type": media_type})
+
+    return None
+
+
+def _augment_context_with_media_analysis(
+    context_line: Optional[str],
+    media_payloads: Sequence[Dict[str, Any]],
+) -> str:
+    base = str(context_line or "").strip()
+    extras: list[str] = []
+    for payload in media_payloads:
+        if not isinstance(payload, dict):
+            continue
+        analysis = payload.get("analysis")
+        if not isinstance(analysis, dict):
+            continue
+        label = analysis.get("label")
+        text = analysis.get("text")
+        if isinstance(label, str) and label.strip() and isinstance(text, str) and text.strip():
+            extras.append(f"{label.strip()}: {text.strip()}")
+
+    if not extras:
+        return base
+
+    extras_text = "; ".join(extras)
+    if base:
+        return f"{base} ({extras_text})"
+    return extras_text
 
 
 def _compose_media_strings(
@@ -607,10 +801,8 @@ async def _prepare_context_media(client: Any, message: Any, media_descriptions: 
         data_bytes = await _download_media_bytes(client, message, media_obj)
         if not data_bytes:
             continue
-        encoded = base64.b64encode(data_bytes).decode("ascii")
         payload: Dict[str, Any] = {
             "type": media_type,
-            "data": encoded,
         }
         display_val = desc.get("display")
         if isinstance(display_val, str) and display_val.strip():
@@ -627,18 +819,36 @@ async def _prepare_context_media(client: Any, message: Any, media_descriptions: 
             if clean_info:
                 payload["info"] = clean_info
         mime = _resolve_media_mime_type(message, media_obj, info)
-        if mime:
-            payload["mime_type"] = mime
         format_hint = _normalize_format_hint(info.get("format")) if isinstance(info, dict) else None
-        if not format_hint and mime:
-            format_hint = _infer_format_from_mime(mime)
-        if format_hint:
-            payload["format"] = format_hint
+        final_mime = mime
+        final_format = format_hint
+
+        if media_type in {"voice", "audio"}:
+            ensured = await _ensure_supported_audio_bytes(data_bytes, format_hint, mime)
+            if not ensured:
+                continue
+            data_bytes, final_format, final_mime = ensured
+        else:
+            if not final_format and final_mime:
+                final_format = _infer_format_from_mime(final_mime)
+
+        encoded = base64.b64encode(data_bytes).decode("ascii")
+        payload["data"] = encoded
+
+        if final_mime:
+            payload["mime_type"] = final_mime
+        if final_format:
+            payload["format"] = final_format
+            if payload.get("info"):
+                payload["info"]["format"] = str(final_format).upper()
         duration = info.get("duration") if isinstance(info, dict) else None
         if duration and media_type in {"voice", "audio", "video"}:
             payload["duration"] = duration
         if media_type == "video" and getattr(message, "video_note", None) is not None:
             payload["subtype"] = "video_note"
+        analysis = await _generate_media_analysis(payload)
+        if analysis:
+            payload["analysis"] = analysis
         payloads.append(payload)
     return payloads
 
@@ -1487,6 +1697,7 @@ async def _collect_warp_dialog_state(
                         context_line = " ".join(context_tokens)
                     else:
                         context_line = "[Медиа]"
+                context_line = _augment_context_with_media_analysis(context_line, media_payloads)
                 context_entries.append(f"{role} {ident}: {context_line}")
                 structured_entry: Dict[str, Any] = {
                     "role": role,
