@@ -82,192 +82,12 @@ def _extract_document_filename(document: Any) -> Optional[str]:
     return None
 
 
-def _format_file_size(raw_size: Any) -> Optional[str]:
-    try:
-        if raw_size is None:
-            return None
-        size_int = int(raw_size)
-    except (TypeError, ValueError):
-        return None
-    if size_int <= 0:
-        return None
-
-    units = ("B", "KB", "MB", "GB", "TB")
-    value = float(size_int)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(round(value))} B"
-            if value < 10:
-                formatted = f"{value:.1f}".rstrip("0").rstrip(".")
-            else:
-                formatted = f"{value:.0f}"
-            return f"{formatted} {unit}"
-        value /= 1024
-
-    return None
-
-
-def _extract_media_file_details(message: Any) -> Dict[str, str]:
-    details: Dict[str, str] = {}
-
-    file_obj = getattr(message, "file", None)
-    document = getattr(message, "document", None)
-
-    name: Optional[str] = None
-    ext: Optional[str] = None
-    mime_type: Optional[str] = None
-    size_candidate: Any = None
-
-    if file_obj is not None:
-        file_name = getattr(file_obj, "name", None)
-        if isinstance(file_name, str) and file_name.strip():
-            name = file_name.strip()
-        file_ext = getattr(file_obj, "ext", None)
-        if isinstance(file_ext, str) and file_ext.strip():
-            ext = file_ext.strip()
-        file_mime = getattr(file_obj, "mime_type", None)
-        if isinstance(file_mime, str) and file_mime.strip():
-            mime_type = file_mime.strip()
-        size_val = getattr(file_obj, "size", None)
-        if size_val not in (None, 0):
-            size_candidate = size_val
-
-    if document is not None:
-        if name is None:
-            filename = _extract_document_filename(document)
-            if filename:
-                name = filename
-        if mime_type is None:
-            doc_mime = getattr(document, "mime_type", None)
-            if isinstance(doc_mime, str) and doc_mime.strip():
-                mime_type = doc_mime.strip()
-        if size_candidate in (None, 0):
-            doc_size = getattr(document, "size", None)
-            if doc_size not in (None, 0):
-                size_candidate = doc_size
-
-    for media_attr in ("photo", "video", "audio"):
-        media_obj = getattr(message, media_attr, None)
-        if media_obj is not None and size_candidate in (None, 0):
-            media_size = getattr(media_obj, "size", None)
-            if media_size not in (None, 0):
-                size_candidate = media_size
-
-    if ext is None and isinstance(name, str):
-        _, dot, suffix = name.rpartition(".")
-        if dot and suffix:
-            ext = suffix
-
-    if isinstance(name, str) and name.strip():
-        details["name"] = name.strip()
-
-    if isinstance(mime_type, str) and mime_type.strip():
-        details["mime_type"] = mime_type.strip()
-
-    format_hint: Optional[str] = None
-    if isinstance(ext, str) and ext.strip():
-        ext_clean = ext.strip().lstrip(".")
-        if ext_clean:
-            format_hint = ext_clean.upper()
-    if not format_hint and isinstance(mime_type, str) and "/" in mime_type:
-        subtype = mime_type.split("/", 1)[1].strip()
-        if subtype:
-            format_hint = subtype.upper()
-    if format_hint:
-        details["format"] = format_hint
-
-    size_formatted = _format_file_size(size_candidate)
-    if size_formatted:
-        details["size"] = size_formatted
-
-    return details
-
-
-def _compose_media_strings(
-    emoji: str,
-    title: str,
-    *,
-    detail_parts: Optional[Sequence[str]] = None,
-    suffix: Optional[str] = None,
-    context_detail: Optional[Sequence[str]] = None,
-    context_suffix: Optional[str] = None,
-) -> tuple[str, str]:
-    display = f"{emoji} {title}".strip()
-
-    details = [str(part).strip() for part in (detail_parts or []) if str(part).strip()]
-    if details:
-        display = f"{display} ({', '.join(details)})"
-
-    if isinstance(suffix, str) and suffix.strip():
-        display = f"{display} {suffix.strip()}"
-
-    context_core = title
-    context_details = [str(part).strip() for part in (context_detail or []) if str(part).strip()]
-    if context_details:
-        context_core = f"{context_core}: {', '.join(context_details)}"
-    if isinstance(context_suffix, str) and context_suffix.strip():
-        context_core = f"{context_core} {context_suffix.strip()}"
-
-    return display, f"[{context_core}]"
-
-
-def _collect_media_descriptions(message: Any) -> list[dict[str, Any]]:
-    descriptions: list[dict[str, Any]] = []
-
-    file_details = _extract_media_file_details(message)
-
-    def _add_entry(
-        media_type: str,
-        emoji: str,
-        title: str,
-        *,
-        detail_parts: Optional[Sequence[str]] = None,
-        suffix: Optional[str] = None,
-        context_detail: Optional[Sequence[str]] = None,
-        context_suffix: Optional[str] = None,
-        extra_info: Optional[Dict[str, str]] = None,
-        include_file_details: bool = False,
-    ) -> None:
-        info: Dict[str, str] = {}
-        if include_file_details:
-            for key, value in file_details.items():
-                if isinstance(value, str) and value.strip():
-                    info[key] = value.strip()
-        if extra_info:
-            for key, value in extra_info.items():
-                if isinstance(value, str) and value.strip():
-                    info[key] = value.strip()
-
-        display, context = _compose_media_strings(
-            emoji,
-            title,
-            detail_parts=detail_parts,
-            suffix=suffix,
-            context_detail=context_detail,
-            context_suffix=context_suffix,
-        )
-
-        descriptions.append(
-            {
-                "display": display,
-                "context": context,
-                "media_type": media_type,
-                "info": info or None,
-            }
-        )
+def _collect_media_descriptions(message: Any) -> list[tuple[str, str]]:
+    descriptions: list[tuple[str, str]] = []
 
     photo = getattr(message, "photo", None)
     if photo is not None:
-        detail = [file_details.get("name"), file_details.get("format")]
-        _add_entry(
-            "photo",
-            "🖼",
-            "Фото",
-            detail_parts=detail,
-            context_detail=detail,
-            include_file_details=True,
-        )
+        descriptions.append(("🖼 Фото", "[Фото]"))
 
     voice = getattr(message, "voice", None)
     if voice is not None:
@@ -279,44 +99,12 @@ def _collect_media_descriptions(message: Any) -> list[dict[str, Any]]:
                     duration = _format_media_duration(getattr(attr, "duration", None))
                     if duration:
                         break
-        extra_info: Dict[str, str] = {}
+        label = "🎙 Голосовое сообщение"
+        context_label = "[Голосовое сообщение]"
         if duration:
-            extra_info["duration"] = duration
-        _add_entry(
-            "voice",
-            "🎙",
-            "Голосовое сообщение",
-            suffix=duration,
-            context_suffix=duration,
-            include_file_details=True,
-            extra_info=extra_info or None,
-        )
-
-    audio = getattr(message, "audio", None)
-    if audio is not None and voice is None:
-        duration = _format_media_duration(getattr(audio, "duration", None))
-        if duration is None:
-            attrs = getattr(audio, "attributes", None)
-            if isinstance(attrs, (list, tuple)):
-                for attr in attrs:
-                    duration = _format_media_duration(getattr(attr, "duration", None))
-                    if duration:
-                        break
-        extra_info: Dict[str, str] = {}
-        if duration:
-            extra_info["duration"] = duration
-        detail = [file_details.get("name"), file_details.get("format")]
-        _add_entry(
-            "audio",
-            "🎧",
-            "Аудио сообщение",
-            detail_parts=detail,
-            context_detail=detail,
-            suffix=duration,
-            context_suffix=duration,
-            include_file_details=True,
-            extra_info=extra_info or None,
-        )
+            label = f"{label} {duration}"
+            context_label = f"[Голосовое сообщение {duration}]"
+        descriptions.append((label, context_label))
 
     video = getattr(message, "video", None)
     video_note = getattr(message, "video_note", None)
@@ -330,155 +118,54 @@ def _collect_media_descriptions(message: Any) -> list[dict[str, Any]]:
                     duration = _format_media_duration(getattr(attr, "duration", None))
                     if duration:
                         break
-        extra_info: Dict[str, str] = {}
+        label = "🎬 Видео"
+        context_label = "[Видео]"
         if duration:
-            extra_info["duration"] = duration
-        detail = [file_details.get("name"), file_details.get("format")]
-        _add_entry(
-            "video",
-            "🎬",
-            "Видео",
-            detail_parts=detail,
-            context_detail=detail,
-            suffix=duration,
-            context_suffix=duration,
-            include_file_details=True,
-            extra_info=extra_info or None,
-        )
+            label = f"{label} {duration}"
+            context_label = f"[Видео {duration}]"
+        descriptions.append((label, context_label))
 
     document = getattr(message, "document", None)
-    sticker = getattr(message, "sticker", None)
-    gif = getattr(message, "gif", None)
-    mime_type_raw = getattr(document, "mime_type", None) if document is not None else None
-    mime_type = str(mime_type_raw or "")
-
-    audio_present = audio is not None or voice is not None
-
     if document is not None:
-        if sticker is not None:
-            detail = [file_details.get("format")]
-            _add_entry(
-                "sticker",
-                "🔖",
-                "Стикер",
-                detail_parts=detail,
-                context_detail=detail,
-                include_file_details=True,
-            )
-        elif gif is not None:
-            detail = [file_details.get("name"), file_details.get("format")]
-            _add_entry(
-                "gif",
-                "🎞",
-                "GIF анимация",
-                detail_parts=detail,
-                context_detail=detail,
-                include_file_details=True,
-            )
-        elif mime_type.startswith("image/") and photo is None:
-            detail = [file_details.get("name"), file_details.get("format")]
-            _add_entry(
-                "photo",
-                "🖼",
-                "Фото",
-                detail_parts=detail,
-                context_detail=detail,
-                include_file_details=True,
-            )
-        elif not audio_present and video_like is None:
-            detail = [file_details.get("name"), file_details.get("format")]
-            _add_entry(
-                "document",
-                "📄",
-                "Документ",
-                detail_parts=detail,
-                context_detail=detail,
-                include_file_details=True,
-            )
+        mime_type_raw = getattr(document, "mime_type", None)
+        mime_type = str(mime_type_raw or "")
+        filename = _extract_document_filename(document)
+        is_voice_doc = voice is not None
+        is_video_doc = video_like is not None
+        is_sticker = bool(getattr(message, "sticker", None))
+        is_gif = bool(getattr(message, "gif", None))
 
-    file_obj = getattr(message, "file", None)
-    if file_obj is not None and not descriptions:
-        detail = [file_details.get("name"), file_details.get("format")]
-        _add_entry(
-            "file",
-            "📁",
-            "Файл",
-            detail_parts=detail,
-            context_detail=detail,
-            include_file_details=True,
-        )
-
-    geo = getattr(message, "geo", None)
-    if geo is None:
-        media_obj = getattr(message, "media", None)
-        geo = getattr(media_obj, "geo", None) if media_obj is not None else None
-    if geo is not None:
-        lat = getattr(geo, "lat", None)
-        if lat is None:
-            lat = getattr(geo, "latitude", None)
-        lon = getattr(geo, "long", None)
-        if lon is None:
-            lon = getattr(geo, "longitude", None)
-        coord_str: Optional[str] = None
-        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-            coord_str = f"{lat:.5f}, {lon:.5f}"
-        info: Dict[str, str] = {}
-        if coord_str:
-            info["coordinates"] = coord_str
-        _add_entry(
-            "location",
-            "📍",
-            "Локация на карте",
-            context_detail=[coord_str] if coord_str else None,
-            extra_info=info or None,
-        )
+        if mime_type.startswith("image/") and photo is None:
+            label = "🖼 Фото"
+            context_label = "[Фото]"
+            if filename:
+                label = f"{label} ({filename})"
+                context_label = f"[Фото: {filename}]"
+            descriptions.append((label, context_label))
+        elif not (is_voice_doc or is_video_doc or is_sticker or is_gif):
+            label = "📄 Документ"
+            context_label = "[Документ]"
+            detail = filename or (mime_type if mime_type else "")
+            if detail:
+                label = f"{label} ({detail})"
+                context_label = f"[Документ: {detail}]"
+            descriptions.append((label, context_label))
 
     return descriptions
 
 
-def get_media_type(message: Any) -> Optional[str]:
-    descriptions = _collect_media_descriptions(message)
-    if not descriptions:
-        return None
-    media_type = descriptions[0].get("media_type")
-    if isinstance(media_type, str) and media_type.strip():
-        return media_type
-    return None
-
-
-def get_media_info(message: Any) -> Optional[Dict[str, str]]:
-    descriptions = _collect_media_descriptions(message)
-    if not descriptions:
-        return None
-    info = descriptions[0].get("info")
-    if isinstance(info, dict) and info:
-        # Ensure the mapping only contains string values
-        normalized: Dict[str, str] = {}
-        for key, value in info.items():
-            if isinstance(key, str) and isinstance(value, str) and key and value:
-                normalized[key] = value
-        return normalized or None
-    return None
-
-
-def _summarize_message_content(message: Any) -> Dict[str, Any]:
+def _build_message_preview_lines(message: Any) -> tuple[list[str], Optional[str]]:
     raw_text = getattr(message, "message", None)
     text_clean = str(raw_text or "").strip()
-    text_lines = text_clean.splitlines() if text_clean else []
+    preview_lines: list[str] = []
+    if text_clean:
+        preview_lines.append(text_clean)
 
     media_descriptions = _collect_media_descriptions(message)
-    media_preview_lines = [
-        str(desc.get("display"))
-        for desc in media_descriptions
-        if isinstance(desc.get("display"), str) and str(desc.get("display")).strip()
-    ]
+    media_preview_lines = [desc[0] for desc in media_descriptions if desc[0]]
+    preview_lines.extend(media_preview_lines)
 
-    media_context_parts = [
-        str(desc.get("context"))
-        for desc in media_descriptions
-        if isinstance(desc.get("context"), str) and str(desc.get("context")).strip()
-    ]
-
+    media_context_parts = [desc[1] for desc in media_descriptions if desc[1]]
     context_line: Optional[str]
     if text_clean:
         context_line = text_clean
@@ -489,85 +176,7 @@ def _summarize_message_content(message: Any) -> Dict[str, Any]:
     else:
         context_line = None
 
-    primary_info = media_descriptions[0].get("info") if media_descriptions else None
-    primary_type = media_descriptions[0].get("media_type") if media_descriptions else None
-
-    preview_lines = list(text_lines)
-    preview_lines.extend(media_preview_lines)
-
-    summary: Dict[str, Any] = {
-        "text": text_clean,
-        "text_lines": text_lines,
-        "media_lines": media_preview_lines,
-        "preview_lines": preview_lines,
-        "context_line": context_line,
-        "media_descriptions": media_descriptions,
-        "has_media": bool(media_descriptions),
-        "media_type": primary_type if isinstance(primary_type, str) and primary_type else None,
-        "media_info": dict(primary_info) if isinstance(primary_info, dict) and primary_info else None,
-    }
-    return summary
-
-
-def _build_message_preview_lines(message: Any) -> tuple[list[str], Optional[str]]:
-    summary = _summarize_message_content(message)
-    preview_lines = summary.get("preview_lines") or []
-    context_line = summary.get("context_line")
-    return list(preview_lines), context_line if isinstance(context_line, str) else None
-
-
-def _build_miniature_message_entry(
-    message: Any,
-    *,
-    chat_title: str,
-    summary: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Normalize a message summary for miniature rendering."""
-
-    def _coerce_lines(candidate: Any) -> list[str]:
-        if isinstance(candidate, (list, tuple)):
-            return ["" if item is None else str(item) for item in candidate]
-        return []
-
-    summary_data = summary or _summarize_message_content(message)
-    preview_lines_raw = summary_data.get("preview_lines")
-    preview_lines = _coerce_lines(preview_lines_raw)
-    if not preview_lines:
-        return None
-
-    is_outgoing = bool(getattr(message, "out", False))
-    direction = "out" if is_outgoing else "in"
-    author = "Вы" if is_outgoing else str(chat_title or "")
-
-    text_raw = summary_data.get("text")
-    text_value = text_raw if isinstance(text_raw, str) else ""
-    if not text_value.strip():
-        text_value = "\n".join(str(line) for line in preview_lines)
-
-    media_type_raw = summary_data.get("media_type")
-    media_type = media_type_raw if isinstance(media_type_raw, str) and media_type_raw else None
-
-    media_info_raw = summary_data.get("media_info")
-    media_info: Optional[Dict[str, str]] = None
-    if isinstance(media_info_raw, dict) and media_info_raw:
-        normalized: Dict[str, str] = {}
-        for key, value in media_info_raw.items():
-            if isinstance(key, str) and isinstance(value, str) and key and value:
-                normalized[key] = value
-        media_info = normalized or None
-
-    entry = {
-        "direction": direction,
-        "author": author,
-        "text": text_value,
-        "text_lines": _coerce_lines(summary_data.get("text_lines")),
-        "media_lines": _coerce_lines(summary_data.get("media_lines")),
-        "preview_lines": list(preview_lines),
-        "media_type": media_type,
-        "media_info": media_info,
-        "has_media": bool(summary_data.get("has_media")),
-    }
-    return entry
+    return preview_lines, context_line
 
 
 def _build_dialog_preview_text(message: Any) -> Optional[str]:
@@ -1255,14 +864,18 @@ async def _collect_warp_dialog_state(
             except Exception:
                 pass
 
-            summary = _summarize_message_content(mm)
-            context_raw = summary.get("context_line")
-            context_text = context_raw if isinstance(context_raw, str) else None
+            preview_lines, context_text = _build_message_preview_lines(mm)
 
-            if len(preview_buffer) < int(WARP_MINIATURE_LAST):
-                entry = _build_miniature_message_entry(mm, chat_title=title, summary=summary)
-                if entry is not None:
-                    preview_buffer.append(entry)
+            if preview_lines and len(preview_buffer) < int(WARP_MINIATURE_LAST):
+                is_out = bool(getattr(mm, "out", False))
+                author = "Вы" if is_out else title
+                preview_buffer.append(
+                    {
+                        "direction": "out" if is_out else "in",
+                        "author": author,
+                        "text": "\n".join(preview_lines),
+                    }
+                )
 
             if need_context and context_text:
                 try:
@@ -1731,10 +1344,16 @@ async def handle_callback(
                             header_time = dt.strftime("%H:%M")
                     except Exception:
                         header_time = None
-                entry = _build_miniature_message_entry(msg, chat_title=title)
-                if entry is None:
+                preview_lines, _ = _build_message_preview_lines(msg)
+                if not preview_lines:
                     continue
-                messages.append(entry)
+                is_out = bool(getattr(msg, "out", False))
+                author = "Вы" if is_out else title
+                messages.append({
+                    "direction": "out" if is_out else "in",
+                    "author": author,
+                    "text": "\n".join(preview_lines),
+                })
             messages.reverse()
             if stop_spinner is not None:
                 stop_spinner.set()
@@ -2362,10 +1981,22 @@ async def handle_start_payload(
                             header_time = dt.strftime("%H:%M")
                     except Exception:
                         header_time = None
-                entry = _build_miniature_message_entry(msg, chat_title=title)
-                if entry is None:
+                try:
+                    raw = getattr(msg, "message", None)
+                except Exception:
+                    raw = None
+                if not raw:
                     continue
-                messages.append(entry)
+                txt = str(raw).strip()
+                if not txt:
+                    continue
+                is_out = bool(getattr(msg, "out", False))
+                author = "Вы" if is_out else title
+                messages.append({
+                    "direction": "out" if is_out else "in",
+                    "author": author,
+                    "text": txt,
+                })
             messages.reverse()
             if stop_spinner is not None:
                 stop_spinner.set()
@@ -2558,10 +2189,22 @@ async def handle_command(
                             header_time = dt.strftime("%H:%M")
                     except Exception:
                         header_time = None
-                entry = _build_miniature_message_entry(msg, chat_title=title)
-                if entry is None:
+                try:
+                    raw = getattr(msg, "message", None)
+                except Exception:
+                    raw = None
+                if not raw:
                     continue
-                messages.append(entry)
+                txt = str(raw).strip()
+                if not txt:
+                    continue
+                is_out = bool(getattr(msg, "out", False))
+                author = "Вы" if is_out else title
+                messages.append({
+                    "direction": "out" if is_out else "in",
+                    "author": author,
+                    "text": txt,
+                })
             messages.reverse()
             if stop_spinner is not None:
                 stop_spinner.set()

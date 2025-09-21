@@ -176,46 +176,11 @@ def build_warp_miniature(
     for m in messages:
         direction = str(m.get("direction") or "").lower()
         author = escape_html(str(m.get("author") or ""))
-
-        preview_lines = m.get("preview_lines")
-        display_lines_raw: List[str] = []
-        if isinstance(preview_lines, (list, tuple)):
-            for entry in preview_lines:
-                if entry is None:
-                    display_lines_raw.append("")
-                else:
-                    display_lines_raw.append(str(entry))
-        else:
-            text_lines_field = m.get("text_lines")
-            if isinstance(text_lines_field, (list, tuple)):
-                for entry in text_lines_field:
-                    if entry is None:
-                        display_lines_raw.append("")
-                    else:
-                        display_lines_raw.append(str(entry))
-            else:
-                raw_text = m.get("text")
-                if isinstance(raw_text, str) and raw_text:
-                    split_lines = raw_text.splitlines()
-                    display_lines_raw.extend(split_lines if split_lines else [raw_text])
-
-            media_lines_field = m.get("media_lines")
-            if isinstance(media_lines_field, (list, tuple)):
-                for entry in media_lines_field:
-                    if entry is None:
-                        display_lines_raw.append("")
-                    else:
-                        display_lines_raw.append(str(entry))
-            elif m.get("has_media") and not display_lines_raw:
-                fallback_preview = m.get("preview_lines")
-                if isinstance(fallback_preview, (list, tuple)):
-                    for entry in fallback_preview:
-                        if entry is None:
-                            display_lines_raw.append("")
-                        else:
-                            display_lines_raw.append(str(entry))
-
-        text_lines = [escape_html(line) for line in display_lines_raw if line is not None]
+        raw_text = str(m.get("text") or "")
+        text_lines_raw = raw_text.splitlines()
+        if not text_lines_raw:
+            text_lines_raw = [raw_text] if raw_text else []
+        text_lines = [escape_html(line) for line in text_lines_raw]
         if not text_lines:
             continue
         if direction == "out":
