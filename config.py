@@ -40,6 +40,19 @@ LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "openai/gpt-oss-20b")
 LMSTUDIO_API_KEY = os.getenv("LMSTUDIO_API_KEY", "not-needed")
 
 
+# Mistral (OpenAI-compatible) configuration for classifier fallback
+MISTRAL_BASE_URL = os.getenv("MISTRAL_BASE_URL", "https://api.mistral.ai/v1")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "FvDTTMYsChwXYzbCiPUYh6aQaf9ozWJf").strip()
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "magistral-small-latest")
+MISTRAL_MAX_RPS = max(1, int(float(os.getenv("MISTRAL_MAX_RPS", "1"))))
+MISTRAL_MAX_CONCURRENCY = max(1, int(float(os.getenv("MISTRAL_MAX_CONCURRENCY", "1"))))
+MISTRAL_TPM_SOFT = max(0, int(os.getenv("MISTRAL_TPM_SOFT", "500000")))
+MISTRAL_TPMO_SOFT = max(0, int(os.getenv("MISTRAL_TPMO_SOFT", "1000000000")))
+MISTRAL_BACKOFF_BASE_MS = max(100, int(os.getenv("MISTRAL_BACKOFF_BASE_MS", "500")))
+MISTRAL_BACKOFF_MAX_MS = max(MISTRAL_BACKOFF_BASE_MS, int(os.getenv("MISTRAL_BACKOFF_MAX_MS", "8000")))
+MISTRAL_MAX_RETRIES = max(0, int(os.getenv("MISTRAL_MAX_RETRIES", "3")))
+
+
 # Cerebras (OpenAI-compatible) configuration for classification
 CEREBRAS_BASE_URL = os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
 CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
