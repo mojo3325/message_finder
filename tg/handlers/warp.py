@@ -1879,27 +1879,12 @@ async def _handle_warp_generation(
         if not cached_ids and ctx_ids_draft:
             cached_ids = [int(x) for x in ctx_ids_draft if isinstance(x, (int, float, str))]
 
-    (
-        transcript,
-        message_ids,
-        preview_messages,
-        title,
-        header_time,
-        structured_context,
-    ) = await _collect_warp_dialog_state(
-        cache_user_id=cache_user_id,
-        acc=acc,
-        chat_id=target_chat_id,
-        cached_ctx=str(cached_ctx) if cached_ctx else None,
-        cached_ids=cached_ids,
-    )
-
     reply_to_id = None
 
     loading_body, loading_kb = ui.build_warp_miniature(
-        title,
-        header_time,
-        preview_messages,
+        "",
+        None,
+        [],
         target_chat_id,
         loading=True,
         draft_id=draft_id,
@@ -1930,6 +1915,21 @@ async def _handle_warp_generation(
         except Exception:
             stop_spinner = None
             spinner_task = None
+
+        (
+            transcript,
+            message_ids,
+            preview_messages,
+            title,
+            header_time,
+            structured_context,
+        ) = await _collect_warp_dialog_state(
+            cache_user_id=cache_user_id,
+            acc=acc,
+            chat_id=target_chat_id,
+            cached_ctx=str(cached_ctx) if cached_ctx else None,
+            cached_ids=cached_ids,
+        )
 
         t0 = __import__("time").time()
         try:

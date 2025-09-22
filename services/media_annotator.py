@@ -37,9 +37,8 @@ def _call_media_completion(messages: Iterable[Dict[str, Any]], *, estimated_toke
     try:
         completion = client.chat.completions.create(
             model=GEMINI_MODEL,
-            temperature=0,
-            messages=list(messages),
-            max_tokens=256,
+            temperature=1,
+            messages=list(messages)
         )
     except Exception as exc:  # pragma: no cover - network failures
         logger.exception("media annotation request failed: %s", exc)
