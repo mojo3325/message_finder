@@ -84,8 +84,6 @@ async def worker(
                 context_plain = record["context_plain"]
                 context_html = record["context_html"]
 
-                logger.info(f"message: {text}\nlabel: {label}", extra={"plain": True})
-
                 if label == "1":
                     link_all = None
                     chat_obj = None

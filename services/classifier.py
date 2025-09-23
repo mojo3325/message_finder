@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import random
 import re
@@ -56,6 +57,9 @@ _mistral_downshift_active: bool = False
 _mistral_extra_delay_s: float = 0.0
 _MISTRAL_MONTH_WINDOW_S = 30 * 24 * 60 * 60
 
+_REMOTE_BATCH_CHUNK_SIZE = 4
+_LOG_ITEM_PREVIEW_LIMIT = 160
+
 
 BatchEntry = str | tuple[Any, Optional[Any]] | Mapping[str, Any]
 
@@ -66,6 +70,114 @@ class _BatchWorkItem:
     index: int
     text: str
     context: Optional[str]
+
+
+def _format_log_preview(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= _LOG_ITEM_PREVIEW_LIMIT:
+        return cleaned
+    return f"{cleaned[: _LOG_ITEM_PREVIEW_LIMIT - 1]}…"
+
+
+def _summarize_batch_items_for_log(items: list["_BatchWorkItem"]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for item in items:
+        text_preview = _format_log_preview(item.text)
+        summary: dict[str, Any] = {
+            "id": item.request_id,
+            "index": item.index,
+            "text_preview": text_preview if text_preview is not None else "",
+            "text_len": len(item.text),
+        }
+        if item.context:
+            context_preview = _format_log_preview(item.context)
+            summary["context_len"] = len(item.context)
+            if context_preview is not None:
+                summary["context_preview"] = context_preview
+        summaries.append(summary)
+    return summaries
+
+
+def _try_parse_json(raw: str) -> Optional[Any]:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _log_classifier_batch(
+    provider: str,
+    items: list["_BatchWorkItem"],
+    payload_json: str,
+    raw_text: str,
+    result: dict[str, ClassificationResult],
+    *,
+    level: int = logging.INFO,
+    note: Optional[str] = None,
+) -> None:
+    request_items = _summarize_batch_items_for_log(items)
+    log_extra: dict[str, Any] = {
+        "provider": provider,
+        "batch_size": len(items),
+        "request_items": request_items,
+        "parsed": result,
+    }
+    payload_obj = _try_parse_json(payload_json)
+    if isinstance(payload_obj, Mapping) and isinstance(payload_obj.get("items"), list):
+        sanitized_items: list[dict[str, Any]] = []
+        for item in request_items:
+            sanitized_entry: dict[str, Any] = {
+                "id": item["id"],
+                "text": item.get("text_preview", ""),
+            }
+            if "context_preview" in item:
+                sanitized_entry["context"] = item["context_preview"]
+            sanitized_items.append(sanitized_entry)
+        log_extra["request_payload"] = {"items": sanitized_items}
+    elif payload_obj is not None:
+        log_extra["request_payload"] = payload_obj
+    response_obj = _try_parse_json(raw_text)
+    if response_obj is not None:
+        log_extra["response_json"] = response_obj
+    elif raw_text:
+        log_extra["response_raw"] = raw_text
+    if note:
+        log_extra["note"] = note
+    logger.log(level, "classifier_batch_processed", extra={"extra": log_extra})
+
+
+def _default_batch_result(items: list[_BatchWorkItem]) -> dict[str, ClassificationResult]:
+    return {item.request_id: "0" for item in items}
+
+
+def _finalize_batch_result(
+    provider: str,
+    payload_json: str,
+    raw_text: str,
+    items: list[_BatchWorkItem],
+    parsed: dict[str, ClassificationResult],
+) -> dict[str, ClassificationResult]:
+    if parsed:
+        _log_classifier_batch(provider, items, payload_json, raw_text, parsed)
+        return parsed
+
+    default_result = _default_batch_result(items)
+    _log_classifier_batch(
+        provider,
+        items,
+        payload_json,
+        raw_text,
+        default_result,
+        level=logging.WARNING,
+        note="empty_or_unparsed_response",
+    )
+    return default_result
 
 
 def _can_use_mistral() -> bool:
@@ -388,6 +500,18 @@ def _extract_choice_text(response: Any) -> str:
     return ""
 
 
+def _parse_nested_value(value: Any, items: list[_BatchWorkItem]) -> dict[str, ClassificationResult]:
+    if isinstance(value, str):
+        return _parse_batch_response(value, items)
+    if isinstance(value, (Mapping, list)):
+        try:
+            serialized = json.dumps(value)
+        except (TypeError, ValueError):
+            return {}
+        return _parse_batch_response(serialized, items)
+    return {}
+
+
 def _extract_retry_after_seconds(exc: Exception) -> Optional[float]:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None)
@@ -512,15 +636,49 @@ def _parse_batch_response(raw_text: str, items: list[_BatchWorkItem]) -> dict[st
             if result:
                 return result
 
+        for value in data.values():
+            nested = _parse_nested_value(value, items)
+            if nested:
+                return nested
+
     if isinstance(data, list):
         # Sometimes providers may return list of numbers without ids; rely on order
         digits = [str(int(val)) for val in data if isinstance(val, (int, float)) and int(val) in (0, 1)]
-        if len(digits) >= len(items):
-            return {item.request_id: digits[idx] for idx, item in enumerate(items)}
+        if digits:
+            padded = digits + ["0"] * max(0, len(items) - len(digits))
+            return {item.request_id: padded[idx] for idx, item in enumerate(items)}
+
+        for entry in data:
+            nested = _parse_nested_value(entry, items)
+            if nested:
+                return nested
+
+    stripped_full = raw_text.strip()
+    for line in raw_text.splitlines():
+        candidate = line.strip().strip("`").strip()
+        if not candidate or candidate == stripped_full:
+            continue
+        nested = _parse_batch_response(candidate, items)
+        if nested:
+            return nested
+
+    label_matches: list[ClassificationResult] = []
+    for match in re.finditer(r'"label"\s*:\s*("?[01]"?|true|false)', raw_text, flags=re.IGNORECASE):
+        value_raw = match.group(1).strip().strip('"').lower()
+        if value_raw in {"0", "1"}:
+            label_matches.append(value_raw)
+        elif value_raw == "true":
+            label_matches.append("1")
+        elif value_raw == "false":
+            label_matches.append("0")
+    if label_matches:
+        padded = label_matches + ["0"] * max(0, len(items) - len(label_matches))
+        return {item.request_id: padded[idx] for idx, item in enumerate(items)}
 
     digits = re.findall(r"[01]", raw_text)
-    if len(digits) >= len(items) and items:
-        return {item.request_id: _parse_classifier_label(digits[idx]) for idx, item in enumerate(items)}
+    if digits and items:
+        padded = digits + ["0"] * max(0, len(items) - len(digits))
+        return {item.request_id: _parse_classifier_label(padded[idx]) for idx, item in enumerate(items)}
 
     if len(items) == 1:
         label = _parse_classifier_label(raw_text)
@@ -540,13 +698,11 @@ def _call_cerebras_batch(prompt: str, payload_json: str, items: list[_BatchWorkI
         temperature=0.0,
         top_p=1.0,
         max_tokens=max(CLASSIFIER_MAX_OUTPUT_TOKENS, CLASSIFIER_MAX_OUTPUT_TOKENS * len(items) + 8),
-        extra_body={"reasoning_effort": "low"},
+        extra_body={"reasoning_effort": "high"},
     )
     raw_text = _extract_choice_text(response)
-    result = _parse_batch_response(raw_text, items)
-    if not result:
-        raise ValueError("cerebras_invalid_response")
-    return result
+    parsed = _parse_batch_response(raw_text, items)
+    return _finalize_batch_result("cerebras", payload_json, raw_text, items, parsed)
 
 
 def _resolve_lmstudio_model() -> str:
@@ -584,10 +740,8 @@ def _call_local_batch(prompt: str, payload_json: str, items: list[_BatchWorkItem
         extra_body={"reasoning_effort": "medium"},
     )
     raw_text = _extract_choice_text(response)
-    result = _parse_batch_response(raw_text, items)
-    if not result:
-        raise ValueError("lmstudio_invalid_response")
-    return result
+    parsed = _parse_batch_response(raw_text, items)
+    return _finalize_batch_result("lmstudio", payload_json, raw_text, items, parsed)
 
 
 def _call_mistral_batch(prompt: str, payload_json: str, items: list[_BatchWorkItem]) -> dict[str, ClassificationResult]:
@@ -611,34 +765,43 @@ def _call_mistral_batch(prompt: str, payload_json: str, items: list[_BatchWorkIt
         release()
     _record_mistral_usage(getattr(response, "usage", None))
     raw_text = _extract_choice_text(response)
-    result = _parse_batch_response(raw_text, items)
-    if not result:
-        raise ValueError("mistral_invalid_response")
+    parsed = _parse_batch_response(raw_text, items)
     _relax_mistral_delay()
-    return result
+    return _finalize_batch_result("mistral", payload_json, raw_text, items, parsed)
 
 
-def _classify_remote_batch(items: list[_BatchWorkItem], prompt: str) -> dict[str, ClassificationResult]:
+def _classify_remote_chunk(items: list[_BatchWorkItem], prompt: str) -> dict[str, ClassificationResult]:
     if not items:
         return {}
 
     global _local_fallback_active, _cerebras_use_extra_key, _mistral_fallback_active
+    if not _local_fallback_active:
+        if _can_use_mistral():
+            _mistral_fallback_active = True
+        else:
+            _mistral_fallback_active = False
     payload_json = _build_payload_json(items)
     attempts = 0
     mistral_attempts = 0
+    mistral_failed_this_cycle = False
 
     while True:
         try:
             if _local_fallback_active:
+                provider = "lmstudio"
                 return _call_local_batch(prompt, payload_json, items)
-            if _mistral_fallback_active:
-                return _call_mistral_batch(prompt, payload_json, items)
+            if _mistral_fallback_active and not mistral_failed_this_cycle:
+                provider = "mistral"
+                result = _call_mistral_batch(prompt, payload_json, items)
+                _mistral_fallback_active = True
+                return result
+            provider = "cerebras"
             return _call_cerebras_batch(prompt, payload_json, items)
         except Exception as exc:  # noqa: BLE001
             attempts += 1
-            if _mistral_fallback_active and not _local_fallback_active:
+            if provider == "mistral":
                 retryable, status_code, category = _is_mistral_retryable_error(exc)
-                if retryable:
+                if retryable and not _local_fallback_active:
                     mistral_attempts += 1
                     retry_after = _extract_retry_after_seconds(exc) if status_code == 429 else None
                     if status_code == 429:
@@ -663,7 +826,7 @@ def _classify_remote_batch(items: list[_BatchWorkItem], prompt: str) -> dict[str
                         time.sleep(delay)
                         continue
                     logger.warning(
-                        "mistral_retry_exhausted_switch_to_lmstudio",
+                        "mistral_retry_exhausted_switch_to_cerebras",
                         extra={
                             "extra": {
                                 "attempts": mistral_attempts,
@@ -673,16 +836,16 @@ def _classify_remote_batch(items: list[_BatchWorkItem], prompt: str) -> dict[str
                             }
                         },
                     )
-                    _local_fallback_active = True
-                    continue
-                logger.warning(
-                    "mistral_error_switch_to_lmstudio",
-                    extra={"extra": {"status": status_code, "category": category, "error": str(exc)}},
-                )
-                _local_fallback_active = True
+                else:
+                    logger.warning(
+                        "mistral_error_switch_to_cerebras",
+                        extra={"extra": {"status": status_code, "category": category, "error": str(exc)}},
+                    )
+                mistral_failed_this_cycle = True
+                _mistral_fallback_active = False
                 continue
 
-            if not _local_fallback_active:
+            if provider == "cerebras" and not _local_fallback_active:
                 is_tpd = is_cerebras_tpd_limit_error(exc)
                 if is_tpd:
                     if not _cerebras_use_extra_key and CEREBRAS_EXTRA_API:
@@ -692,6 +855,7 @@ def _classify_remote_batch(items: list[_BatchWorkItem], prompt: str) -> dict[str
                     if _can_use_mistral():
                         _mistral_fallback_active = True
                         mistral_attempts = 0
+                        mistral_failed_this_cycle = False
                         logger.warning("cerebras_tpd_switch_to_mistral", extra={"extra": {"error": str(exc)}})
                         continue
                     _local_fallback_active = True
@@ -712,6 +876,25 @@ def _classify_remote_batch(items: list[_BatchWorkItem], prompt: str) -> dict[str
                 return {}
 
             time.sleep(min(2 ** attempts, 10))
+
+
+def _iter_remote_chunks(items: list[_BatchWorkItem], chunk_size: int) -> Iterable[list[_BatchWorkItem]]:
+    chunk_size = max(1, chunk_size)
+    for start in range(0, len(items), chunk_size):
+        yield items[start : start + chunk_size]
+
+
+def _classify_remote_batch(items: list[_BatchWorkItem], prompt: str) -> dict[str, ClassificationResult]:
+    if not items:
+        return {}
+
+    combined: dict[str, ClassificationResult] = {}
+    for chunk in _iter_remote_chunks(items, _REMOTE_BATCH_CHUNK_SIZE):
+        chunk_result = _classify_remote_chunk(chunk, prompt)
+        if chunk_result:
+            combined.update(chunk_result)
+
+    return combined
 
 
 def classify_batch_with_openai_sync(
