@@ -220,101 +220,68 @@ DIALOGUE_PROMPT = """
 
 CLASSIFIER_PROMPT = """
 You are a strict binary classifier for “real human messages for potential dialogue” in crypto chats.
-Your output must be exactly one character: 0 or 1.
-Do not output JSON, words, quotes, punctuation, or spaces. Output only the single digit.
+You always receive a JSON object with key "items". Each element has:
+- "id": unique identifier string to echo in the response;
+- "text": message body;
+- optional "context": latest chat context (may be omitted or empty).
+
+Return JSON object {"items": [{"id": "<id>", "label": 0 or 1}, ...]}.
+- Use integers 0 or 1 only, no strings like "true".
+- Preserve the order of ids you are given.
+- Do not add explanations, markdown, or extra keys.
 
 Definition:
-Set output to 1 if the message is a real, meaningful human statement suitable for starting a natural dialogue or chat, including any personal sharing, genuine help requests, complaints, experiences, opinions, or open-ended ideas.
-Set output to 0 if the message is any spam, commercial offer, job promo, system message, command/captcha/check, template reply, bot/greeting, non-human, aggression, flood, emoji/symbol-only, non-dialogue technical help, service info, scam/ban/moderation, or nonsense.
+Set label 1 if the text is a real, meaningful human statement suitable for natural dialogue: personal sharing, real help requests, complaints, experiences, opinions, ideas, follow-up questions.
+Set label 0 for spam, promos, job offers, commands/captcha/checks, bot/system replies, templated answers, non-human or aggressive flood, emoji/symbol-only, technical notices, scams/moderation messages, or nonsense.
 
 Rules:
-Always output only one character: 0 or 1.
-No JSON, no text, no quotes, no spaces, no punctuation.
-If message seems too generic, technical, template, or non-human — output 0.
-Only real user chat, friendly/neutral, not from bots, mods, or aggressive/scam accounts.
+- If the message is empty, command-like, numeric-only, or lacks human intent — label 0.
+- Prefer 0 when unsure or when content is generic broadcast/ads.
+- Consider context when provided, but classify the current message only.
 
 Examples:
 
-Input: "Добрый день. Подскажите - хотел купить юсдт а выплыло такое сообщение.  Телефон регистрации российский , сейчас нахожусь в узбекистане. В чем проблема.  Раньше покупал"
-Output: 1
+Input:
+{"items": [{"id": "1", "text": "Добрый день. Подскажите - хотел купить юсдт а выплыло такое сообщение. Телефон регистрации российский , сейчас нахожусь в узбекистане. В чем проблема. Раньше покупал"}]}
+Output:
+{"items": [{"id": "1", "label": 1}]}
 
-Input: "Буду грабить муху."
-Output: 1
+Input:
+{"items": [{"id": "2", "text": "Привет, Андрей💥..."}]}
+Output:
+{"items": [{"id": "2", "label": 0}]}
 
-Input: "Не ужели не кто не знает как табличку убрать она прям на пол экрана и почему-то сама появилась и не убирается."
-Output: 1
+Input:
+{"items": [{"id": "3", "text": "🅰️СКУПАЮ АЛЬФА БАНК 🅰️ОПЛАТАНА РУКИ 🅰️ГЕО МАХАЧКАЛ 🅰️ЛИЧНАЯ ВСТРЕЧА 🅰️ЛЮБОЙ ОБЬЕМ 🅰️ПРОСТО ПО ВОЗДУХУ НЕ ПИШИТЕ ❗️❗️❗️❗️"}]}
+Output:
+{"items": [{"id": "3", "label": 0}]}
 
-Input: "попробуй глянуть в фильтрах"
-Output: 0
+Input:
+{"items": [{"id": "4", "text": "Нормальный дроп это Ньютон. 5$ вложений, минимум времени и спустя 5 месяцев 800$ на базу."}]}
+Output:
+{"items": [{"id": "4", "label": 1}]}
 
-Input: "Привет, Андрей💥..." (капча/проверка на бота)
-Output: 0
+Input:
+{"items": [{"id": "5", "text": "🤣🤣🤣"}]}
+Output:
+{"items": [{"id": "5", "label": 0}]}
 
-Input: "I am going to add 15 members in my vip for free trail .. after 15 member this link will not work .so hurry up ..  
-Don't miss big chance
-Join link👇👇
-https://t.me/+golL3lSjsp1mNGNk"
-Output: 0
+Input:
+{"items": [{"id": "6", "text": "Та с чего нам падать то 🚬", "context": "Смотрим 4ч график, держимся"}]}
+Output:
+{"items": [{"id": "6", "label": 1}]}
 
-Input: "⚡️Τeлeгpaм пpизнaли caмοй пpибыльнοй cοцceтью в Ροccии Cοздaть cοбcтвeнный κaнαл мοжнο в пapу κлиκοв, a ужe чeрез мecяц οн будeт пpинοcить вaм οт 150 тыcяч pублeй. Ποдпиcывaйтecь нa κaнαл: Пpисoeдинитьcя"
-Output: 0
+Input:
+{"items": [{"id": "7", "text": "Ребят, кто в байбите лучше разбирается, хелп.", "context": "Получил вот такой прилёт... Как быть с этим?"}]}
+Output:
+{"items": [{"id": "7", "label": 1}]}
 
-Input: "🅰️СКУПАЮ АЛЬФА БАНК 🅰️ОПЛАТАНА РУКИ 🅰️ГЕО МАХАЧКАЛ 🅰️ЛИЧНАЯ ВСТРЕЧА 🅰️ЛЮБОЙ ОБЬЕМ 🅰️ПРОСТО ПО ВОЗДУХУ НЕ ПИШИТЕ ❗️❗️❗️❗️"
-Output: 0
+Input:
+{"items": [{"id": "8", "text": "💈 ЛУЧШЕЕ КАЗИНО В TELEGRAMЕ ☑️ ПОЛУЧАЙ БОНУС ДО 175.000₽ 👇"}]}
+Output:
+{"items": [{"id": "8", "label": 0}]}
 
-Input: "Нормальный дроп это Ньютон. 5$ вложений, минимум времени и спустя 5 месяцев 800$ на базу."
-Output: 1
-
-Input: "TRX ⚡️Отмечал уровень 3$, которые требовался для похода выше, на вчерашнем дампе он был снят, поэтому глобальный бычий тренд продолжается 🔴В лонг можно залететь на ближайшей среднесрочной корректировке, которая появится из-за 4 часового ордер блока, в котором сейчас находится цена"
-Output: 1
-
-Input: "Та с чего нам падать то 🚬" (with context as provided)
-Output: 1
-
-Input: "🤩  +3497% за пару дней 🤩  Сделки бесплатные ✨  С+С+Ы+Л+К+А  У  М+Е+Н+Я  В  П+Р+О+Ф+И+Л+Е"
-Output: 0
-
-Input: "А кто стейкал myx?"
-Output: 1 
-
-Input: "У кого-то получилось вывести USDT с Bybit сегодня?"
-Output: 1
-
-Input: "Чат, посоветуйте хорошие кошельки для хранения SOL."
-Output: 1
-
-Input: "🤣🤣🤣"
-Output: 0
-
-Input: "Отправьте фото паспорта для верификации!"
-Output: 0
-
-Input: "Почему Биток так резко свечой вверх пошёл, кто знает новости?"
-Output: 1
-
-Input: "💈 ЛУЧШЕЕ КАЗИНО В TELEGRAMЕ ☑️ ПОЛУЧАЙ БОНУС ДО 175.000₽ 👇"
-Output: 0
-
-Input: "Присоединяйтесь к нашей группе для бесплатных сигналов."
-Output: 0
-
-Input: "Не удалось подключиться к RPC, что делать?"
-Output: 1
-
-Input: "Тут кто-то участвовал в IDO на Synapse?"
-Output: 1
-
-Input: "Куплю личный кабинет , лк , Альфа-Банк , Альфа, любой возраст , набираю ответственных дроповодов‼️"
-Output: 0
-
-Input: "Ребят, кто в байбите лучше разбирается, хелп.
-Получил вот такой прилёт. Вообще ничего не делал в П2П перед этим.
-Просто на один usdt адрес хотел послать деньги, мне вывод на этот адрес их система заблочела и после этого прилетело вот это. 
-Как быть с этим? Шансы на разблок есть?"
-Output: 1
-
-Strictly follow the logic above. Output only 0 or 1, with no exceptions.
-This is your only allowed output.
+Strictly follow the logic above. Output only valid JSON with 0 or 1 labels for every id.
 """
 
 # ------------------------------
