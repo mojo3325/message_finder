@@ -44,38 +44,29 @@ def load_feedback_examples() -> List[str]:
             return []
 
     formatted_examples: List[str] = []
-    for ex in examples_data:
+    for i, ex in enumerate(examples_data):
         message = ex.get("message", "")
-        output = ex.get("output", {})
+        output = ex.get("output", "")
         label = ex.get("label")
 
         if not message:
             continue
 
-        # 1) Пытаемся взять классификацию из output.classification или строкового output
-        classification_value: str = ""
-        if isinstance(output, dict):
-            try:
-                classification_value = str(output.get("classification", "")).strip()
-            except Exception:
-                classification_value = ""
-        elif isinstance(output, str):
-            ov = output.strip()
-            if ov in {"0", "1"}:
-                classification_value = ov
+        # Определяем правильный label для классификации
+        classification_label: int = 0
+        if isinstance(output, str) and output.strip() in {"0", "1"}:
+            classification_label = int(output.strip())
+        elif isinstance(label, int) and label in (0, 1):
+            classification_label = label
+        else:
+            # Пропускаем записи без корректной разметки
+            continue
 
-        # 2) Если в output нет валидного значения, используем label (0/1)
-        if classification_value not in {"0", "1"}:
-            if label in (0, 1):
-                classification_value = "1" if label == 1 else "0"
-            else:
-                # пропускаем записи без корректной разметки
-                continue
-
-        # Для нового бинарного формата обучающих примеров возвращаем только 0/1 без JSON
-        formatted_examples.append(
-            f'Input: {json.dumps(message, ensure_ascii=False)}\nOutput: {classification_value}'
-        )
+        # Форматируем в стиле примеров из CLASSIFIER_PROMPT
+        input_json = json.dumps({"items": [{"id": str(i + 1), "text": message}]}, ensure_ascii=False)
+        output_json = json.dumps({"items": [{"id": str(i + 1), "label": classification_label}]}, ensure_ascii=False)
+        
+        formatted_examples.append(f"Input:\n{input_json}\nOutput:\n{output_json}")
 
     return formatted_examples
 

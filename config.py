@@ -7,6 +7,9 @@ import os
 LOG_LEVEL = "INFO"
 REQUEST_TIMEOUT_S = 20.0
 RETRY_MAX_ATTEMPTS = 3
+CLASSIFIER_MAX_OUTPUT_TOKENS = max(8, int(os.getenv("CLASSIFIER_MAX_OUTPUT_TOKENS", "32")))
+CLASSIFIER_CONTEXT_CHAR_LIMIT = max(256, int(os.getenv("CLASSIFIER_CONTEXT_CHAR_LIMIT", "1200")))
+CLASSIFIER_MESSAGE_CHAR_LIMIT = max(128, int(os.getenv("CLASSIFIER_MESSAGE_CHAR_LIMIT", "800")))
 
 
 def _is_running_in_docker() -> bool:
@@ -51,6 +54,8 @@ MISTRAL_TPMO_SOFT = max(0, int(os.getenv("MISTRAL_TPMO_SOFT", "1000000000")))
 MISTRAL_BACKOFF_BASE_MS = max(100, int(os.getenv("MISTRAL_BACKOFF_BASE_MS", "500")))
 MISTRAL_BACKOFF_MAX_MS = max(MISTRAL_BACKOFF_BASE_MS, int(os.getenv("MISTRAL_BACKOFF_MAX_MS", "8000")))
 MISTRAL_MAX_RETRIES = max(0, int(os.getenv("MISTRAL_MAX_RETRIES", "3")))
+MISTRAL_BATCH_MAX_SIZE = max(1, int(os.getenv("MISTRAL_BATCH_MAX_SIZE", "8")))
+MISTRAL_BATCH_FLUSH_MS = max(50, int(os.getenv("MISTRAL_BATCH_FLUSH_MS", "400")))
 
 
 # Cerebras (OpenAI-compatible) configuration for classification
