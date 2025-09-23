@@ -487,14 +487,28 @@ def _parse_batch_response(raw_text: str, items: list[_BatchWorkItem]) -> dict[st
         entries = data.get("items")
         if isinstance(entries, list):
             result: dict[str, ClassificationResult] = {}
-            for entry in entries:
-                if not isinstance(entry, Mapping):
+            fallback_by_index: list[tuple[int, ClassificationResult]] = []
+            for idx, entry in enumerate(entries):
+                if isinstance(entry, Mapping):
+                    entry_id_raw = entry.get("id")
+                    entry_id = str(entry_id_raw).strip() if entry_id_raw is not None else ""
+                    label = _parse_classifier_label(entry.get("label"))
+                    if entry_id:
+                        result[entry_id] = label
+                        continue
+                    fallback_by_index.append((idx, label))
                     continue
-                entry_id = str(entry.get("id", "")).strip()
-                if not entry_id:
-                    continue
-                label = _parse_classifier_label(entry.get("label"))
-                result[entry_id] = label
+
+                # Handle providers returning bare values instead of objects.
+                label = _parse_classifier_label(entry)
+                fallback_by_index.append((idx, label))
+
+            for idx, label in fallback_by_index:
+                if 0 <= idx < len(items):
+                    request_id = items[idx].request_id
+                    if request_id not in result:
+                        result[request_id] = label
+
             if result:
                 return result
 
