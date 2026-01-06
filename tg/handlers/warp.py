@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import os
+import shutil
+import subprocess
+import tempfile
 import unicodedata
 from datetime import timezone
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
@@ -15,6 +21,7 @@ from services.drafts import drafts_store
 from services.feedback import save_feedback
 from services.user_sessions import create_client_from_session
 import services.replier as replier_service
+import services.media_annotator as media_annotator
 
 from tg import bot_api, ui
 from utilities.accounts_store import get_user_account
@@ -55,6 +62,25 @@ _WARP_DIALOG_FETCH_LIMIT: Optional[int] = 500
 
 _WARP_EXCLUDED_USER_IDS: tuple[int, ...] = (777000,)
 
+_SUPPORTED_AUDIO_FORMATS = {"mp3", "wav"}
+_AUDIO_FORMAT_ALIASES = {
+    "mpeg": "mp3",
+    "mpga": "mp3",
+    "mp2": "mp3",
+    "mp1": "mp3",
+    "mpega": "mp3",
+    "wave": "wav",
+    "x-wav": "wav",
+    "x-pn-wav": "wav",
+    "oga": "ogg",
+    "opus": "ogg",
+    "spx": "ogg",
+}
+
+_FFMPEG_PATH_CACHE: Optional[str] = None
+_FFMPEG_PATH_PROBED: bool = False
+_FFMPEG_MISSING_LOGGED: bool = False
+
 
 def _format_media_duration(raw_duration: Any) -> Optional[str]:
     try:
@@ -82,12 +108,381 @@ def _extract_document_filename(document: Any) -> Optional[str]:
     return None
 
 
-def _collect_media_descriptions(message: Any) -> list[tuple[str, str]]:
-    descriptions: list[tuple[str, str]] = []
+def _format_file_size(raw_size: Any) -> Optional[str]:
+    try:
+        if raw_size is None:
+            return None
+        size_int = int(raw_size)
+    except (TypeError, ValueError):
+        return None
+    if size_int <= 0:
+        return None
+
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size_int)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(round(value))} B"
+            if value < 10:
+                formatted = f"{value:.1f}".rstrip("0").rstrip(".")
+            else:
+                formatted = f"{value:.0f}"
+            return f"{formatted} {unit}"
+        value /= 1024
+
+    return None
+
+
+def _extract_media_file_details(message: Any) -> Dict[str, str]:
+    details: Dict[str, str] = {}
+
+    file_obj = getattr(message, "file", None)
+    document = getattr(message, "document", None)
+
+    name: Optional[str] = None
+    ext: Optional[str] = None
+    mime_type: Optional[str] = None
+    size_candidate: Any = None
+
+    if file_obj is not None:
+        file_name = getattr(file_obj, "name", None)
+        if isinstance(file_name, str) and file_name.strip():
+            name = file_name.strip()
+        file_ext = getattr(file_obj, "ext", None)
+        if isinstance(file_ext, str) and file_ext.strip():
+            ext = file_ext.strip()
+        file_mime = getattr(file_obj, "mime_type", None)
+        if isinstance(file_mime, str) and file_mime.strip():
+            mime_type = file_mime.strip()
+        size_val = getattr(file_obj, "size", None)
+        if size_val not in (None, 0):
+            size_candidate = size_val
+
+    if document is not None:
+        if name is None:
+            filename = _extract_document_filename(document)
+            if filename:
+                name = filename
+        if mime_type is None:
+            doc_mime = getattr(document, "mime_type", None)
+            if isinstance(doc_mime, str) and doc_mime.strip():
+                mime_type = doc_mime.strip()
+        if size_candidate in (None, 0):
+            doc_size = getattr(document, "size", None)
+            if doc_size not in (None, 0):
+                size_candidate = doc_size
+
+    for media_attr in ("photo", "video", "audio"):
+        media_obj = getattr(message, media_attr, None)
+        if media_obj is not None and size_candidate in (None, 0):
+            media_size = getattr(media_obj, "size", None)
+            if media_size not in (None, 0):
+                size_candidate = media_size
+
+    if ext is None and isinstance(name, str):
+        _, dot, suffix = name.rpartition(".")
+        if dot and suffix:
+            ext = suffix
+
+    if isinstance(name, str) and name.strip():
+        details["name"] = name.strip()
+
+    if isinstance(mime_type, str) and mime_type.strip():
+        details["mime_type"] = mime_type.strip()
+
+    format_hint: Optional[str] = None
+    if isinstance(ext, str) and ext.strip():
+        ext_clean = ext.strip().lstrip(".")
+        if ext_clean:
+            format_hint = ext_clean.upper()
+    if not format_hint and isinstance(mime_type, str) and "/" in mime_type:
+        subtype = mime_type.split("/", 1)[1].strip()
+        if subtype:
+            format_hint = subtype.upper()
+    if format_hint:
+        details["format"] = format_hint
+
+    size_formatted = _format_file_size(size_candidate)
+    if size_formatted:
+        details["size"] = size_formatted
+
+    return details
+
+
+def _normalize_format_hint(raw: Any) -> Optional[str]:
+    if isinstance(raw, str):
+        cleaned = raw.strip().lstrip(".")
+        if cleaned:
+            return cleaned.lower()
+    return None
+
+
+def _normalize_audio_format_hint(raw: Optional[str]) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip().lower()
+    if not value:
+        return None
+    return _AUDIO_FORMAT_ALIASES.get(value, value)
+
+
+def _get_ffmpeg_path() -> Optional[str]:
+    global _FFMPEG_PATH_CACHE, _FFMPEG_PATH_PROBED
+    if not _FFMPEG_PATH_PROBED:
+        _FFMPEG_PATH_CACHE = shutil.which("ffmpeg")
+        _FFMPEG_PATH_PROBED = True
+    return _FFMPEG_PATH_CACHE
+
+
+def _transcode_audio_bytes_to_wav_sync(data: bytes, source_format: Optional[str]) -> Optional[bytes]:
+    global _FFMPEG_MISSING_LOGGED
+    ffmpeg_path = _get_ffmpeg_path()
+    if not ffmpeg_path:
+        if not _FFMPEG_MISSING_LOGGED:
+            logger.warning(
+                "ffmpeg binary not found; voice messages will be sent without audio payload",
+                extra={"needs_ffmpeg": True},
+            )
+            _FFMPEG_MISSING_LOGGED = True
+        return None
+
+    suffix = f".{source_format}" if source_format else ".bin"
+    src_path: Optional[str] = None
+    dst_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as src_file:
+            src_file.write(data)
+            src_file.flush()
+            src_path = src_file.name
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as dst_file:
+            dst_path = dst_file.name
+
+        proc = subprocess.run(
+            [ffmpeg_path, "-y", "-i", src_path, "-ar", "16000", "-ac", "1", dst_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if proc.returncode != 0:
+            stderr_text = proc.stderr.decode("utf-8", "ignore")
+            logger.warning(
+                "ffmpeg failed to transcode audio payload",
+                extra={"returncode": proc.returncode, "stderr": stderr_text[:400]},
+            )
+            return None
+
+        with open(dst_path, "rb") as converted_file:
+            converted = converted_file.read()
+        if not converted:
+            logger.warning("ffmpeg produced empty audio payload for voice message")
+            return None
+        return converted
+    finally:
+        for path in (src_path, dst_path):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def _ensure_supported_audio_bytes(
+    data: bytes,
+    format_hint: Optional[str],
+    mime_type: Optional[str],
+) -> Optional[tuple[bytes, str, str]]:
+    normalized_format = _normalize_audio_format_hint(format_hint)
+    if not normalized_format and mime_type:
+        normalized_format = _normalize_audio_format_hint(_infer_format_from_mime(mime_type))
+
+    if normalized_format in _SUPPORTED_AUDIO_FORMATS:
+        target_mime = "audio/mpeg" if normalized_format == "mp3" else "audio/wav"
+        return data, normalized_format, target_mime
+
+    converted = await asyncio.to_thread(
+        _transcode_audio_bytes_to_wav_sync,
+        data,
+        normalized_format,
+    )
+    if not converted:
+        logger.warning(
+            "Skipping audio attachment with unsupported format for model context",
+            extra={
+                "format": normalized_format or format_hint or "unknown",
+                "mime_type": mime_type,
+            },
+        )
+        return None
+
+    return converted, "wav", "audio/wav"
+
+
+async def _generate_media_analysis(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    media_type = str(payload.get("type") or "").lower()
+    data = payload.get("data")
+    if not isinstance(data, str) or not data.strip():
+        return None
+
+    async def _call(func: Callable[..., Optional[str]], *args: Any) -> Optional[str]:
+        result = await asyncio.to_thread(func, *args)
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        return None
+
+    try:
+        if media_type in {"voice", "audio"}:
+            fmt = str(payload.get("format") or "").strip()
+            if not fmt:
+                return None
+            transcript = await _call(media_annotator.transcribe_audio_base64, data, fmt)
+            if transcript:
+                return {"label": "Транскрипция", "text": transcript}
+        elif media_type == "photo":
+            mime = payload.get("mime_type")
+            mime_val = str(mime).strip() if isinstance(mime, str) else ""
+            if not mime_val:
+                fmt = str(payload.get("format") or "").strip()
+                if fmt:
+                    mime_val = f"image/{fmt.lower()}"
+            if not mime_val:
+                return None
+            description = await _call(media_annotator.describe_image_base64, data, mime_val)
+            if description:
+                return {"label": "Описание", "text": description}
+        elif media_type == "video":
+            fmt = str(payload.get("format") or "").strip() or "mp4"
+            summary = await _call(media_annotator.summarize_video_base64, data, fmt)
+            if summary:
+                return {"label": "Описание", "text": summary}
+    except Exception:
+        logger.exception("media analysis generation failed", extra={"media_type": media_type})
+
+    return None
+
+
+def _augment_context_with_media_analysis(
+    context_line: Optional[str],
+    media_payloads: Sequence[Dict[str, Any]],
+) -> str:
+    base = str(context_line or "").strip()
+    extras: list[str] = []
+    for payload in media_payloads:
+        if not isinstance(payload, dict):
+            continue
+        analysis = payload.get("analysis")
+        if not isinstance(analysis, dict):
+            continue
+        label = analysis.get("label")
+        text = analysis.get("text")
+        if isinstance(label, str) and label.strip() and isinstance(text, str) and text.strip():
+            extras.append(f"{label.strip()}: {text.strip()}")
+
+    if not extras:
+        return base
+
+    extras_text = "; ".join(extras)
+    if base:
+        return f"{base} ({extras_text})"
+    return extras_text
+
+
+def _compose_media_strings(
+    emoji: str,
+    title: str,
+    *,
+    detail_parts: Optional[Sequence[str]] = None,
+    suffix: Optional[str] = None,
+    context_detail: Optional[Sequence[str]] = None,
+    context_suffix: Optional[str] = None,
+) -> tuple[str, str]:
+    display = f"{emoji} {title}".strip()
+
+    details = [str(part).strip() for part in (detail_parts or []) if str(part).strip()]
+    if details:
+        display = f"{display} ({', '.join(details)})"
+
+    if isinstance(suffix, str) and suffix.strip():
+        display = f"{display} {suffix.strip()}"
+
+    context_core = title
+    context_details = [str(part).strip() for part in (context_detail or []) if str(part).strip()]
+    if context_details:
+        context_core = f"{context_core}: {', '.join(context_details)}"
+    if isinstance(context_suffix, str) and context_suffix.strip():
+        context_core = f"{context_core} {context_suffix.strip()}"
+
+    return display, f"[{context_core}]"
+
+
+def _collect_media_descriptions(message: Any) -> list[dict[str, Any]]:
+    descriptions: list[dict[str, Any]] = []
+
+    file_details = _extract_media_file_details(message)
+
+    def _add_entry(
+        media_type: str,
+        emoji: str,
+        title: str,
+        *,
+        detail_parts: Optional[Sequence[str]] = None,
+        suffix: Optional[str] = None,
+        context_detail: Optional[Sequence[str]] = None,
+        context_suffix: Optional[str] = None,
+        extra_info: Optional[Dict[str, str]] = None,
+        include_file_details: bool = False,
+        display_override: Optional[str] = None,
+        context_override: Optional[str] = None,
+    ) -> None:
+        info: Dict[str, str] = {}
+        if include_file_details:
+            for key, value in file_details.items():
+                if isinstance(value, str) and value.strip():
+                    info[key] = value.strip()
+        if extra_info:
+            for key, value in extra_info.items():
+                if isinstance(value, str) and value.strip():
+                    info[key] = value.strip()
+
+        display, context = _compose_media_strings(
+            emoji,
+            title,
+            detail_parts=detail_parts,
+            suffix=suffix,
+            context_detail=context_detail,
+            context_suffix=context_suffix,
+        )
+
+        if isinstance(display_override, str) and display_override.strip():
+            display = display_override.strip()
+        if isinstance(context_override, str) and context_override.strip():
+            context = context_override.strip()
+
+        descriptions.append(
+            {
+                "display": display,
+                "context": context,
+                "media_type": media_type,
+                "info": info or None,
+            }
+        )
 
     photo = getattr(message, "photo", None)
     if photo is not None:
-        descriptions.append(("🖼 Фото", "[Фото]"))
+        fmt = _normalize_format_hint(file_details.get("format"))
+        label = "изображение"
+        label_with_fmt = f"{label}.{fmt}" if fmt else label
+        display_override = f"🖼 {label_with_fmt}"
+        context_override = f"[Фото: {label_with_fmt}]"
+        _add_entry(
+            "photo",
+            "🖼",
+            "Фото",
+            include_file_details=True,
+            display_override=display_override,
+            context_override=context_override,
+        )
 
     voice = getattr(message, "voice", None)
     if voice is not None:
@@ -99,12 +494,50 @@ def _collect_media_descriptions(message: Any) -> list[tuple[str, str]]:
                     duration = _format_media_duration(getattr(attr, "duration", None))
                     if duration:
                         break
-        label = "🎙 Голосовое сообщение"
-        context_label = "[Голосовое сообщение]"
+        extra_info: Dict[str, str] = {}
         if duration:
-            label = f"{label} {duration}"
-            context_label = f"[Голосовое сообщение {duration}]"
-        descriptions.append((label, context_label))
+            extra_info["duration"] = duration
+        _add_entry(
+            "voice",
+            "🎙",
+            "Голосовое сообщение",
+            suffix=duration,
+            context_suffix=duration,
+            include_file_details=True,
+            extra_info=extra_info or None,
+        )
+
+    audio = getattr(message, "audio", None)
+    if audio is not None and voice is None:
+        duration = _format_media_duration(getattr(audio, "duration", None))
+        if duration is None:
+            attrs = getattr(audio, "attributes", None)
+            if isinstance(attrs, (list, tuple)):
+                for attr in attrs:
+                    duration = _format_media_duration(getattr(attr, "duration", None))
+                    if duration:
+                        break
+        extra_info: Dict[str, str] = {}
+        if duration:
+            extra_info["duration"] = duration
+        fmt = _normalize_format_hint(file_details.get("format"))
+        label = "аудио сообщение"
+        label_with_fmt = f"{label}.{fmt}" if fmt else label
+        display_override = f"🎧 {label_with_fmt}{f' {duration}' if duration else ''}".strip()
+        context_suffix_value = duration
+        context_override = (
+            f"[Аудио сообщение: {label_with_fmt}{f' {duration}' if duration else ''}]"
+        )
+        _add_entry(
+            "audio",
+            "🎧",
+            "Аудио сообщение",
+            include_file_details=True,
+            extra_info=extra_info or None,
+            display_override=display_override,
+            context_override=context_override,
+            context_suffix=context_suffix_value,
+        )
 
     video = getattr(message, "video", None)
     video_note = getattr(message, "video_note", None)
@@ -118,54 +551,326 @@ def _collect_media_descriptions(message: Any) -> list[tuple[str, str]]:
                     duration = _format_media_duration(getattr(attr, "duration", None))
                     if duration:
                         break
-        label = "🎬 Видео"
-        context_label = "[Видео]"
+        extra_info: Dict[str, str] = {}
         if duration:
-            label = f"{label} {duration}"
-            context_label = f"[Видео {duration}]"
-        descriptions.append((label, context_label))
+            extra_info["duration"] = duration
+        fmt = _normalize_format_hint(file_details.get("format"))
+        base_label = "видеосообщение" if video_note is not None else "видео"
+        label_with_fmt = f"{base_label}.{fmt}" if fmt else base_label
+        display_override = f"🎬 {label_with_fmt}{f' {duration}' if duration else ''}".strip()
+        context_override = (
+            f"[Видео: {label_with_fmt}{f' {duration}' if duration else ''}]"
+        )
+        _add_entry(
+            "video",
+            "🎬",
+            "Видео",
+            include_file_details=True,
+            extra_info=extra_info or None,
+            display_override=display_override,
+            context_override=context_override,
+            context_suffix=duration,
+        )
 
     document = getattr(message, "document", None)
-    if document is not None:
-        mime_type_raw = getattr(document, "mime_type", None)
-        mime_type = str(mime_type_raw or "")
-        filename = _extract_document_filename(document)
-        is_voice_doc = voice is not None
-        is_video_doc = video_like is not None
-        is_sticker = bool(getattr(message, "sticker", None))
-        is_gif = bool(getattr(message, "gif", None))
+    sticker = getattr(message, "sticker", None)
+    gif = getattr(message, "gif", None)
+    mime_type_raw = getattr(document, "mime_type", None) if document is not None else None
+    mime_type = str(mime_type_raw or "")
 
-        if mime_type.startswith("image/") and photo is None:
-            label = "🖼 Фото"
-            context_label = "[Фото]"
-            if filename:
-                label = f"{label} ({filename})"
-                context_label = f"[Фото: {filename}]"
-            descriptions.append((label, context_label))
-        elif not (is_voice_doc or is_video_doc or is_sticker or is_gif):
-            label = "📄 Документ"
-            context_label = "[Документ]"
-            detail = filename or (mime_type if mime_type else "")
-            if detail:
-                label = f"{label} ({detail})"
-                context_label = f"[Документ: {detail}]"
-            descriptions.append((label, context_label))
+    audio_present = audio is not None or voice is not None
+
+    if document is not None:
+        if sticker is not None:
+            fmt = _normalize_format_hint(file_details.get("format"))
+            label = "стикер"
+            label_with_fmt = f"{label}.{fmt}" if fmt else label
+            display_override = f"🔖 {label_with_fmt}"
+            context_override = f"[Стикер: {label_with_fmt}]"
+            _add_entry(
+                "sticker",
+                "🔖",
+                "Стикер",
+                include_file_details=True,
+                display_override=display_override,
+                context_override=context_override,
+            )
+        elif gif is not None:
+            display_override = "🎞 gif анимация"
+            context_override = "[GIF анимация]"
+            _add_entry(
+                "gif",
+                "🎞",
+                "GIF анимация",
+                include_file_details=True,
+                display_override=display_override,
+                context_override=context_override,
+            )
+        elif mime_type.startswith("image/") and photo is None:
+            fmt = _normalize_format_hint(file_details.get("format"))
+            label = "изображение"
+            label_with_fmt = f"{label}.{fmt}" if fmt else label
+            display_override = f"🖼 {label_with_fmt}"
+            context_override = f"[Фото: {label_with_fmt}]"
+            _add_entry(
+                "photo",
+                "🖼",
+                "Фото",
+                include_file_details=True,
+                display_override=display_override,
+                context_override=context_override,
+            )
+        elif not audio_present and video_like is None:
+            fmt = _normalize_format_hint(file_details.get("format"))
+            label = "документ"
+            label_with_fmt = f"{label}.{fmt}" if fmt else label
+            display_override = f"📄 {label_with_fmt}"
+            context_override = f"[Документ: {label_with_fmt}]"
+            _add_entry(
+                "document",
+                "📄",
+                "Документ",
+                include_file_details=True,
+                display_override=display_override,
+                context_override=context_override,
+            )
+
+    file_obj = getattr(message, "file", None)
+    if file_obj is not None and not descriptions:
+        fmt = _normalize_format_hint(file_details.get("format"))
+        label = "файл"
+        label_with_fmt = f"{label}.{fmt}" if fmt else label
+        display_override = f"📁 {label_with_fmt}"
+        context_override = f"[Файл: {label_with_fmt}]"
+        _add_entry(
+            "file",
+            "📁",
+            "Файл",
+            include_file_details=True,
+            display_override=display_override,
+            context_override=context_override,
+        )
+
+    geo = getattr(message, "geo", None)
+    if geo is None:
+        media_obj = getattr(message, "media", None)
+        geo = getattr(media_obj, "geo", None) if media_obj is not None else None
+    if geo is not None:
+        lat = getattr(geo, "lat", None)
+        if lat is None:
+            lat = getattr(geo, "latitude", None)
+        lon = getattr(geo, "long", None)
+        if lon is None:
+            lon = getattr(geo, "longitude", None)
+        coord_str: Optional[str] = None
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            coord_str = f"{lat:.5f}, {lon:.5f}"
+        info: Dict[str, str] = {}
+        if coord_str:
+            info["coordinates"] = coord_str
+        _add_entry(
+            "location",
+            "📍",
+            "Локация на карте",
+            context_detail=[coord_str] if coord_str else None,
+            extra_info=info or None,
+        )
 
     return descriptions
 
 
-def _build_message_preview_lines(message: Any) -> tuple[list[str], Optional[str]]:
+def get_media_type(message: Any) -> Optional[str]:
+    descriptions = _collect_media_descriptions(message)
+    if not descriptions:
+        return None
+    media_type = descriptions[0].get("media_type")
+    if isinstance(media_type, str) and media_type.strip():
+        return media_type
+    return None
+
+
+def get_media_info(message: Any) -> Optional[Dict[str, str]]:
+    descriptions = _collect_media_descriptions(message)
+    if not descriptions:
+        return None
+    info = descriptions[0].get("info")
+    if isinstance(info, dict) and info:
+        # Ensure the mapping only contains string values
+        normalized: Dict[str, str] = {}
+        for key, value in info.items():
+            if isinstance(key, str) and isinstance(value, str) and key and value:
+                normalized[key] = value
+        return normalized or None
+    return None
+
+
+def _resolve_media_object(message: Any, media_type: str) -> Any:
+    mt = media_type.lower()
+    if mt == "photo":
+        return getattr(message, "photo", None) or getattr(message, "document", None)
+    if mt == "video":
+        return (
+            getattr(message, "video", None)
+            or getattr(message, "video_note", None)
+            or getattr(message, "document", None)
+        )
+    if mt == "voice":
+        return getattr(message, "voice", None) or getattr(message, "audio", None) or getattr(message, "document", None)
+    if mt == "audio":
+        return getattr(message, "audio", None) or getattr(message, "document", None)
+    return getattr(message, "document", None) or getattr(message, "file", None) or getattr(message, "media", None)
+
+
+def _infer_format_from_mime(mime: Optional[str]) -> Optional[str]:
+    if not isinstance(mime, str):
+        return None
+    parts = mime.split("/", 1)
+    if len(parts) != 2:
+        return None
+    subtype = parts[1].strip().lower()
+    if not subtype:
+        return None
+    if subtype == "jpeg":
+        return "jpg"
+    if "+" in subtype:
+        subtype = subtype.split("+", 1)[0]
+    return subtype or None
+
+
+def _resolve_media_mime_type(message: Any, media_obj: Any, info: Optional[Dict[str, str]]) -> Optional[str]:
+    candidates = []
+    if isinstance(info, dict):
+        candidates.append(info.get("mime_type"))
+    if media_obj is not None:
+        candidates.append(getattr(media_obj, "mime_type", None))
+    file_obj = getattr(message, "file", None)
+    if file_obj is not None:
+        candidates.append(getattr(file_obj, "mime_type", None))
+    document = getattr(message, "document", None)
+    if document is not None:
+        candidates.append(getattr(document, "mime_type", None))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+async def _download_media_bytes(client: Any, message: Any, media_obj: Any) -> Optional[bytes]:
+    if client is None:
+        return None
+    target = media_obj if media_obj is not None else message
+    if target is None:
+        return None
+    buffer = io.BytesIO()
+    try:
+        result = await client.download_media(target, file=buffer)
+    except Exception:
+        return None
+    if isinstance(result, bytes):
+        data = result
+    elif hasattr(result, "getvalue"):
+        try:
+            data = result.getvalue()
+        except Exception:
+            data = None
+    else:
+        data = buffer.getvalue()
+    if not data:
+        data = buffer.getvalue()
+    if not data:
+        return None
+    return data
+
+
+async def _prepare_context_media(client: Any, message: Any, media_descriptions: Any) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    if not isinstance(media_descriptions, list):
+        return payloads
+    for desc in media_descriptions:
+        if not isinstance(desc, dict):
+            continue
+        media_type_raw = desc.get("media_type")
+        if not isinstance(media_type_raw, str):
+            continue
+        media_type = media_type_raw.lower()
+        if media_type not in {"photo", "voice", "audio", "video"}:
+            continue
+        info_raw = desc.get("info")
+        info = info_raw if isinstance(info_raw, dict) else {}
+        media_obj = _resolve_media_object(message, media_type)
+        data_bytes = await _download_media_bytes(client, message, media_obj)
+        if not data_bytes:
+            continue
+        payload: Dict[str, Any] = {
+            "type": media_type,
+        }
+        display_val = desc.get("display")
+        if isinstance(display_val, str) and display_val.strip():
+            payload["display"] = display_val.strip()
+        context_val = desc.get("context")
+        if isinstance(context_val, str) and context_val.strip():
+            payload["context"] = context_val.strip()
+        if info:
+            clean_info = {
+                str(key): str(value)
+                for key, value in info.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+            if clean_info:
+                payload["info"] = clean_info
+        mime = _resolve_media_mime_type(message, media_obj, info)
+        format_hint = _normalize_format_hint(info.get("format")) if isinstance(info, dict) else None
+        final_mime = mime
+        final_format = format_hint
+
+        if media_type in {"voice", "audio"}:
+            ensured = await _ensure_supported_audio_bytes(data_bytes, format_hint, mime)
+            if not ensured:
+                continue
+            data_bytes, final_format, final_mime = ensured
+        else:
+            if not final_format and final_mime:
+                final_format = _infer_format_from_mime(final_mime)
+
+        encoded = base64.b64encode(data_bytes).decode("ascii")
+        payload["data"] = encoded
+
+        if final_mime:
+            payload["mime_type"] = final_mime
+        if final_format:
+            payload["format"] = final_format
+            if payload.get("info"):
+                payload["info"]["format"] = str(final_format).upper()
+        duration = info.get("duration") if isinstance(info, dict) else None
+        if duration and media_type in {"voice", "audio", "video"}:
+            payload["duration"] = duration
+        if media_type == "video" and getattr(message, "video_note", None) is not None:
+            payload["subtype"] = "video_note"
+        analysis = await _generate_media_analysis(payload)
+        if analysis:
+            payload["analysis"] = analysis
+        payloads.append(payload)
+    return payloads
+
+
+def _summarize_message_content(message: Any) -> Dict[str, Any]:
     raw_text = getattr(message, "message", None)
     text_clean = str(raw_text or "").strip()
-    preview_lines: list[str] = []
-    if text_clean:
-        preview_lines.append(text_clean)
+    text_lines = text_clean.splitlines() if text_clean else []
 
     media_descriptions = _collect_media_descriptions(message)
-    media_preview_lines = [desc[0] for desc in media_descriptions if desc[0]]
-    preview_lines.extend(media_preview_lines)
+    media_preview_lines = [
+        str(desc.get("display"))
+        for desc in media_descriptions
+        if isinstance(desc.get("display"), str) and str(desc.get("display")).strip()
+    ]
 
-    media_context_parts = [desc[1] for desc in media_descriptions if desc[1]]
+    media_context_parts = [
+        str(desc.get("context"))
+        for desc in media_descriptions
+        if isinstance(desc.get("context"), str) and str(desc.get("context")).strip()
+    ]
+
     context_line: Optional[str]
     if text_clean:
         context_line = text_clean
@@ -176,7 +881,85 @@ def _build_message_preview_lines(message: Any) -> tuple[list[str], Optional[str]
     else:
         context_line = None
 
-    return preview_lines, context_line
+    primary_info = media_descriptions[0].get("info") if media_descriptions else None
+    primary_type = media_descriptions[0].get("media_type") if media_descriptions else None
+
+    preview_lines = list(text_lines)
+    preview_lines.extend(media_preview_lines)
+
+    summary: Dict[str, Any] = {
+        "text": text_clean,
+        "text_lines": text_lines,
+        "media_lines": media_preview_lines,
+        "preview_lines": preview_lines,
+        "context_line": context_line,
+        "media_descriptions": media_descriptions,
+        "has_media": bool(media_descriptions),
+        "media_type": primary_type if isinstance(primary_type, str) and primary_type else None,
+        "media_info": dict(primary_info) if isinstance(primary_info, dict) and primary_info else None,
+    }
+    return summary
+
+
+def _build_message_preview_lines(message: Any) -> tuple[list[str], Optional[str]]:
+    summary = _summarize_message_content(message)
+    preview_lines = summary.get("preview_lines") or []
+    context_line = summary.get("context_line")
+    return list(preview_lines), context_line if isinstance(context_line, str) else None
+
+
+def _build_miniature_message_entry(
+    message: Any,
+    *,
+    chat_title: str,
+    summary: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize a message summary for miniature rendering."""
+
+    def _coerce_lines(candidate: Any) -> list[str]:
+        if isinstance(candidate, (list, tuple)):
+            return ["" if item is None else str(item) for item in candidate]
+        return []
+
+    summary_data = summary or _summarize_message_content(message)
+    preview_lines_raw = summary_data.get("preview_lines")
+    preview_lines = _coerce_lines(preview_lines_raw)
+    if not preview_lines:
+        return None
+
+    is_outgoing = bool(getattr(message, "out", False))
+    direction = "out" if is_outgoing else "in"
+    author = "Вы" if is_outgoing else str(chat_title or "")
+
+    text_raw = summary_data.get("text")
+    text_value = text_raw if isinstance(text_raw, str) else ""
+    if not text_value.strip():
+        text_value = "\n".join(str(line) for line in preview_lines)
+
+    media_type_raw = summary_data.get("media_type")
+    media_type = media_type_raw if isinstance(media_type_raw, str) and media_type_raw else None
+
+    media_info_raw = summary_data.get("media_info")
+    media_info: Optional[Dict[str, str]] = None
+    if isinstance(media_info_raw, dict) and media_info_raw:
+        normalized: Dict[str, str] = {}
+        for key, value in media_info_raw.items():
+            if isinstance(key, str) and isinstance(value, str) and key and value:
+                normalized[key] = value
+        media_info = normalized or None
+
+    entry = {
+        "direction": direction,
+        "author": author,
+        "text": text_value,
+        "text_lines": _coerce_lines(summary_data.get("text_lines")),
+        "media_lines": _coerce_lines(summary_data.get("media_lines")),
+        "preview_lines": list(preview_lines),
+        "media_type": media_type,
+        "media_info": media_info,
+        "has_media": bool(summary_data.get("has_media")),
+    }
+    return entry
 
 
 def _build_dialog_preview_text(message: Any) -> Optional[str]:
@@ -807,12 +1590,9 @@ async def _collect_warp_dialog_state(
     cached_ids: list[int],
 ) -> Tuple[str, list[int], list[dict], str, Optional[str]]:
     need_context = not cached_ctx or not cached_ids
-    limit_ctx = int(WARP_CONTEXT_LIMIT) if need_context else 0
-    limit_fetch = max(int(WARP_MINIATURE_LAST), limit_ctx)
-    if limit_fetch <= 0:
-        limit_fetch = int(WARP_MINIATURE_LAST)
     preview_buffer: list[dict] = []
     context_entries: list[str] = []
+    structured_context: list[dict[str, Any]] = []
     context_ids: list[int] = []
     header_time: Optional[str] = None
     title = str(chat_id)
@@ -845,6 +1625,31 @@ async def _collect_warp_dialog_state(
             else:
                 title = str(chat_id)
 
+        latest_cached_id: Optional[int] = None
+        if cached_ids:
+            try:
+                latest_cached_id = int(cached_ids[-1])
+            except Exception:
+                latest_cached_id = None
+        current_latest_id: Optional[int] = None
+        if not need_context and latest_cached_id is not None:
+            try:
+                async for newest_msg in client_idx.iter_messages(entity=fetch_target, limit=1):
+                    try:
+                        current_latest_id = int(getattr(newest_msg, "id", 0) or 0)
+                    except Exception:
+                        current_latest_id = None
+                    break
+            except Exception:
+                current_latest_id = None
+            if current_latest_id is None or current_latest_id != latest_cached_id:
+                need_context = True
+
+        limit_ctx = int(WARP_CONTEXT_LIMIT) if need_context else 0
+        limit_fetch = max(int(WARP_MINIATURE_LAST), limit_ctx)
+        if limit_fetch <= 0:
+            limit_fetch = int(WARP_MINIATURE_LAST)
+
         if need_context:
             try:
                 logger.info(
@@ -864,20 +1669,24 @@ async def _collect_warp_dialog_state(
             except Exception:
                 pass
 
-            preview_lines, context_text = _build_message_preview_lines(mm)
+            summary = _summarize_message_content(mm)
+            context_raw = summary.get("context_line")
+            context_text = context_raw if isinstance(context_raw, str) else None
 
-            if preview_lines and len(preview_buffer) < int(WARP_MINIATURE_LAST):
-                is_out = bool(getattr(mm, "out", False))
-                author = "Вы" if is_out else title
-                preview_buffer.append(
-                    {
-                        "direction": "out" if is_out else "in",
-                        "author": author,
-                        "text": "\n".join(preview_lines),
-                    }
-                )
+            if len(preview_buffer) < int(WARP_MINIATURE_LAST):
+                entry = _build_miniature_message_entry(mm, chat_title=title, summary=summary)
+                if entry is not None:
+                    preview_buffer.append(entry)
 
-            if need_context and context_text:
+            media_descriptions = summary.get("media_descriptions")
+            media_payloads: list[dict[str, Any]] = []
+            if need_context:
+                try:
+                    media_payloads = await _prepare_context_media(client_idx, mm, media_descriptions)
+                except Exception:
+                    media_payloads = []
+
+            if need_context and (context_text or media_payloads):
                 try:
                     snd = await mm.get_sender()
                 except Exception:
@@ -896,11 +1705,33 @@ async def _collect_warp_dialog_state(
                     if auser
                     else (f"id:{auid}" if auid else (f"id:{owner_uid}" if role == "OWNER" and owner_uid else "id:?"))
                 )
-                context_entries.append(f"{role} {ident}: {context_text}")
+                context_line = context_text or ""
+                if not context_line and media_payloads:
+                    context_tokens: list[str] = []
+                    for media_payload in media_payloads:
+                        if not isinstance(media_payload, dict):
+                            continue
+                        ctx_piece = media_payload.get("context") or media_payload.get("display")
+                        if isinstance(ctx_piece, str) and ctx_piece.strip():
+                            context_tokens.append(ctx_piece.strip())
+                    if context_tokens:
+                        context_line = " ".join(context_tokens)
+                    else:
+                        context_line = "[Медиа]"
+                context_line = _augment_context_with_media_analysis(context_line, media_payloads)
+                context_entries.append(f"{role} {ident}: {context_line}")
+                structured_entry: Dict[str, Any] = {
+                    "role": role,
+                    "identifier": ident,
+                    "text": context_line,
+                }
+                if media_payloads:
+                    structured_entry["media"] = media_payloads
                 try:
                     context_ids.append(int(getattr(mm, "id", 0) or 0))
                 except Exception:
                     context_ids.append(0)
+                structured_context.append(structured_entry)
 
             mini_ready = len(preview_buffer) >= int(WARP_MINIATURE_LAST)
             ctx_ready = (not need_context) or (len(context_ids) >= int(WARP_CONTEXT_LIMIT))
@@ -915,6 +1746,14 @@ async def _collect_warp_dialog_state(
 
         transcript = cached_ctx or ""
         message_ids = list(cached_ids)
+        structured_context_out: Optional[list[dict[str, Any]]] = None
+        if structured_context:
+            structured_context_out = [
+                entry
+                for entry in reversed(structured_context)
+                if isinstance(entry, dict)
+            ] or None
+
         if need_context and context_entries and context_ids:
             context_entries = list(reversed(context_entries))
             context_ids = [int(x) for x in reversed(context_ids) if isinstance(x, (int, float)) and int(x) > 0]
@@ -967,7 +1806,7 @@ async def _collect_warp_dialog_state(
             except Exception:
                 pass
 
-        return transcript or "", message_ids, preview_buffer, title, header_time
+        return transcript or "", message_ids, preview_buffer, title, header_time, structured_context_out
     except Exception as exc:  # noqa: BLE001
         try:
             logger.error(
@@ -1040,20 +1879,12 @@ async def _handle_warp_generation(
         if not cached_ids and ctx_ids_draft:
             cached_ids = [int(x) for x in ctx_ids_draft if isinstance(x, (int, float, str))]
 
-    transcript, message_ids, preview_messages, title, header_time = await _collect_warp_dialog_state(
-        cache_user_id=cache_user_id,
-        acc=acc,
-        chat_id=target_chat_id,
-        cached_ctx=str(cached_ctx) if cached_ctx else None,
-        cached_ids=cached_ids,
-    )
-
     reply_to_id = None
 
     loading_body, loading_kb = ui.build_warp_miniature(
-        title,
-        header_time,
-        preview_messages,
+        "",
+        None,
+        [],
         target_chat_id,
         loading=True,
         draft_id=draft_id,
@@ -1085,6 +1916,21 @@ async def _handle_warp_generation(
             stop_spinner = None
             spinner_task = None
 
+        (
+            transcript,
+            message_ids,
+            preview_messages,
+            title,
+            header_time,
+            structured_context,
+        ) = await _collect_warp_dialog_state(
+            cache_user_id=cache_user_id,
+            acc=acc,
+            chat_id=target_chat_id,
+            cached_ctx=str(cached_ctx) if cached_ctx else None,
+            cached_ids=cached_ids,
+        )
+
         t0 = __import__("time").time()
         try:
             logger.info(
@@ -1100,7 +1946,12 @@ async def _handle_warp_generation(
         except Exception:
             pass
 
-        reply_text_raw = await replier_service.generate_reply("", context=transcript)
+        context_payload: Any
+        if structured_context:
+            context_payload = {"text": transcript, "entries": structured_context}
+        else:
+            context_payload = transcript
+        reply_text_raw = await replier_service.generate_reply("", context=context_payload)
         reply_text = str(reply_text_raw or "").strip()
         try:
             duration_ms = int(max(0.0, (__import__("time").time() - t0) * 1000))
@@ -1344,16 +2195,10 @@ async def handle_callback(
                             header_time = dt.strftime("%H:%M")
                     except Exception:
                         header_time = None
-                preview_lines, _ = _build_message_preview_lines(msg)
-                if not preview_lines:
+                entry = _build_miniature_message_entry(msg, chat_title=title)
+                if entry is None:
                     continue
-                is_out = bool(getattr(msg, "out", False))
-                author = "Вы" if is_out else title
-                messages.append({
-                    "direction": "out" if is_out else "in",
-                    "author": author,
-                    "text": "\n".join(preview_lines),
-                })
+                messages.append(entry)
             messages.reverse()
             if stop_spinner is not None:
                 stop_spinner.set()
@@ -1981,22 +2826,10 @@ async def handle_start_payload(
                             header_time = dt.strftime("%H:%M")
                     except Exception:
                         header_time = None
-                try:
-                    raw = getattr(msg, "message", None)
-                except Exception:
-                    raw = None
-                if not raw:
+                entry = _build_miniature_message_entry(msg, chat_title=title)
+                if entry is None:
                     continue
-                txt = str(raw).strip()
-                if not txt:
-                    continue
-                is_out = bool(getattr(msg, "out", False))
-                author = "Вы" if is_out else title
-                messages.append({
-                    "direction": "out" if is_out else "in",
-                    "author": author,
-                    "text": txt,
-                })
+                messages.append(entry)
             messages.reverse()
             if stop_spinner is not None:
                 stop_spinner.set()
@@ -2189,22 +3022,10 @@ async def handle_command(
                             header_time = dt.strftime("%H:%M")
                     except Exception:
                         header_time = None
-                try:
-                    raw = getattr(msg, "message", None)
-                except Exception:
-                    raw = None
-                if not raw:
+                entry = _build_miniature_message_entry(msg, chat_title=title)
+                if entry is None:
                     continue
-                txt = str(raw).strip()
-                if not txt:
-                    continue
-                is_out = bool(getattr(msg, "out", False))
-                author = "Вы" if is_out else title
-                messages.append({
-                    "direction": "out" if is_out else "in",
-                    "author": author,
-                    "text": txt,
-                })
+                messages.append(entry)
             messages.reverse()
             if stop_spinner is not None:
                 stop_spinner.set()

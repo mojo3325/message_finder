@@ -1,6 +1,6 @@
 import json
 import os
-from typing import List
+from typing import Any, Iterable, List, Mapping, Optional
 
 import filelock
 
@@ -29,6 +29,17 @@ def save_feedback(feedback_data: dict) -> None:
             json.dump(examples, f, ensure_ascii=False, indent=2)
 
 
+def _coerce_examples(data: Any) -> Iterable[Mapping[str, Any]]:
+    if isinstance(data, Mapping):
+        yield data
+        return
+
+    if isinstance(data, list):
+        for entry in data:
+            if isinstance(entry, Mapping):
+                yield entry
+
+
 def load_feedback_examples() -> List[str]:
     if not os.path.exists(FEEDBACK_FILE_PATH):
         return []
@@ -44,38 +55,61 @@ def load_feedback_examples() -> List[str]:
             return []
 
     formatted_examples: List[str] = []
-    for ex in examples_data:
-        message = ex.get("message", "")
-        output = ex.get("output", {})
-        label = ex.get("label")
+    for i, ex in enumerate(_coerce_examples(examples_data)):
+        message_raw = ex.get("message")
+        if isinstance(message_raw, bytes):
+            try:
+                message = message_raw.decode("utf-8", errors="ignore").strip()
+            except Exception:  # noqa: BLE001
+                message = ""
+        elif isinstance(message_raw, str):
+            message = message_raw.strip()
+        elif message_raw is not None:
+            message = str(message_raw).strip()
+        else:
+            message = ""
+
+        output_raw = ex.get("output")
+        if isinstance(output_raw, bytes):
+            try:
+                output_clean = output_raw.decode("utf-8", errors="ignore").strip()
+            except Exception:  # noqa: BLE001
+                output_clean = ""
+        elif isinstance(output_raw, str):
+            output_clean = output_raw.strip()
+        elif isinstance(output_raw, (int, float)):
+            output_clean = str(int(output_raw)).strip()
+        else:
+            output_clean = ""
+
+        label_raw = ex.get("label")
+        label_clean: Optional[int]
+        if isinstance(label_raw, int) and label_raw in (0, 1):
+            label_clean = label_raw
+        elif isinstance(label_raw, str) and label_raw.strip() in {"0", "1"}:
+            label_clean = int(label_raw.strip())
+        else:
+            label_clean = None
 
         if not message:
             continue
 
-        # 1) Пытаемся взять классификацию из output.classification или строкового output
-        classification_value: str = ""
-        if isinstance(output, dict):
-            try:
-                classification_value = str(output.get("classification", "")).strip()
-            except Exception:
-                classification_value = ""
-        elif isinstance(output, str):
-            ov = output.strip()
-            if ov in {"0", "1"}:
-                classification_value = ov
+        # Определяем правильный label для классификации
+        classification_label: Optional[int] = None
+        if output_clean in {"0", "1"}:
+            classification_label = int(output_clean)
+        elif label_clean is not None:
+            classification_label = label_clean
 
-        # 2) Если в output нет валидного значения, используем label (0/1)
-        if classification_value not in {"0", "1"}:
-            if label in (0, 1):
-                classification_value = "1" if label == 1 else "0"
-            else:
-                # пропускаем записи без корректной разметки
-                continue
+        if classification_label is None:
+            # Пропускаем записи без корректной разметки
+            continue
 
-        # Для нового бинарного формата обучающих примеров возвращаем только 0/1 без JSON
-        formatted_examples.append(
-            f'Input: {json.dumps(message, ensure_ascii=False)}\nOutput: {classification_value}'
-        )
+        # Форматируем в стиле примеров из CLASSIFIER_PROMPT
+        input_json = json.dumps({"items": [{"id": str(i + 1), "text": message}]}, ensure_ascii=False)
+        output_json = json.dumps({"items": [{"id": str(i + 1), "label": classification_label}]}, ensure_ascii=False)
+        
+        formatted_examples.append(f"Input:\n{input_json}\nOutput:\n{output_json}")
 
     return formatted_examples
 

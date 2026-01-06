@@ -36,6 +36,7 @@ def get_cerebras_client(api_key: str | None = None) -> OpenAI:
         base_url=_normalize_base_url(CEREBRAS_BASE_URL),
         api_key=desired_key,
         timeout=REQUEST_TIMEOUT_S,
+        max_retries=0,
     )
     _oa_client_key = desired_key
     return _oa_client
@@ -45,7 +46,12 @@ def get_groq_client() -> OpenAI:
     global _groq_client
     if _groq_client is not None:
         return _groq_client
-    _groq_client = OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_API_KEY, timeout=REQUEST_TIMEOUT_S)
+    _groq_client = OpenAI(
+        base_url=GROQ_BASE_URL,
+        api_key=GROQ_API_KEY,
+        timeout=REQUEST_TIMEOUT_S,
+        max_retries=0,
+    )
     return _groq_client
 
 
@@ -54,7 +60,10 @@ def get_gemini_client() -> OpenAI:
     if _gemini_client is not None:
         return _gemini_client
     _gemini_client = OpenAI(
-        base_url=_normalize_base_url(GEMINI_BASE_URL), api_key=GEMINI_API_KEY, timeout=REQUEST_TIMEOUT_S
+        base_url=_normalize_base_url(GEMINI_BASE_URL),
+        api_key=GEMINI_API_KEY,
+        timeout=REQUEST_TIMEOUT_S,
+        max_retries=0,
     )
     return _gemini_client
 
@@ -64,7 +73,10 @@ def get_lmstudio_client() -> OpenAI:
     if _lm_client is not None:
         return _lm_client
     _lm_client = OpenAI(
-        base_url=_normalize_base_url(LMSTUDIO_BASE_URL), api_key=LMSTUDIO_API_KEY, timeout=REQUEST_TIMEOUT_S, max_retries=1
+        base_url=_normalize_base_url(LMSTUDIO_BASE_URL),
+        api_key=LMSTUDIO_API_KEY,
+        timeout=REQUEST_TIMEOUT_S,
+        max_retries=0,
     )
     return _lm_client
 
