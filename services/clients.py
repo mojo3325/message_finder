@@ -1,5 +1,3 @@
-import os
-
 import httpx
 from openai import OpenAI
 
@@ -13,8 +11,6 @@ from config import (
     GROQ_API_KEY,
     GEMINI_BASE_URL,
     GEMINI_API_KEY,
-    MISTRAL_BASE_URL,
-    MISTRAL_API_KEY,
 )
 
 
@@ -23,8 +19,6 @@ _oa_client_key: str | None = None
 _groq_client: OpenAI | None = None
 _gemini_client: OpenAI | None = None
 _lm_client: OpenAI | None = None
-_mistral_client: OpenAI | None = None
-_mistral_client_config: tuple[str, str] | None = None  # (base_url, api_key)
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -85,25 +79,6 @@ def get_lmstudio_client() -> OpenAI:
         max_retries=0,
     )
     return _lm_client
-
-
-def get_mistral_client() -> OpenAI:
-    global _mistral_client, _mistral_client_config
-
-    desired_base = _normalize_base_url(os.getenv("MISTRAL_BASE_URL", MISTRAL_BASE_URL))
-    desired_key = os.getenv("MISTRAL_API_KEY", MISTRAL_API_KEY).strip()
-
-    if _mistral_client is not None and _mistral_client_config == (desired_base, desired_key):
-        return _mistral_client
-
-    _mistral_client = OpenAI(
-        base_url=desired_base,
-        api_key=desired_key,
-        timeout=REQUEST_TIMEOUT_S,
-        max_retries=0,
-    )
-    _mistral_client_config = (desired_base, desired_key)
-    return _mistral_client
 
 
 def get_http_client() -> httpx.AsyncClient:

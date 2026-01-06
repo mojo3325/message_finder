@@ -8,7 +8,7 @@ from logging_config import logger
 from core.dedup import DedupStore
 from core.rate_limiter import rate_limiter
 import services.classifier as classifier_service
-from config import MISTRAL_BATCH_FLUSH_MS, MISTRAL_BATCH_MAX_SIZE
+from config import CLASSIFIER_BATCH_FLUSH_MS, CLASSIFIER_BATCH_MAX_SIZE
 from tg import context as tg_context
 from tg.notifier import notifier_send
 
@@ -24,9 +24,9 @@ async def worker(
     while True:
         first_event, first_text = await queue.get()
         batch_items: List[Tuple[events.NewMessage.Event, str]] = [(first_event, first_text)]
-        flush_deadline = time.monotonic() + (MISTRAL_BATCH_FLUSH_MS / 1000.0)
+        flush_deadline = time.monotonic() + (CLASSIFIER_BATCH_FLUSH_MS / 1000.0)
 
-        while len(batch_items) < MISTRAL_BATCH_MAX_SIZE:
+        while len(batch_items) < CLASSIFIER_BATCH_MAX_SIZE:
             remaining = flush_deadline - time.monotonic()
             if remaining <= 0:
                 break

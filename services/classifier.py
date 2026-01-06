@@ -1,13 +1,11 @@
 import json
 import logging
-import os
-import random
 import re
 import time
 from collections import deque
 from dataclasses import dataclass
-from threading import Lock, Semaphore
-from typing import Any, Iterable, Mapping, Optional
+from threading import Lock
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from const import CLASSIFIER_PROMPT
 from core.rate_limiter import estimate_prompt_tokens, gemini_rate_limiter
@@ -19,46 +17,31 @@ from config import (
     CLASSIFIER_CONTEXT_CHAR_LIMIT,
     CLASSIFIER_MAX_OUTPUT_TOKENS,
     CLASSIFIER_MESSAGE_CHAR_LIMIT,
-    MISTRAL_API_KEY,
-    MISTRAL_BACKOFF_BASE_MS,
-    MISTRAL_BACKOFF_MAX_MS,
-    MISTRAL_MAX_CONCURRENCY,
-    MISTRAL_MAX_RETRIES,
-    MISTRAL_MAX_RPS,
-    MISTRAL_MODEL,
-    MISTRAL_TPM_SOFT,
-    MISTRAL_TPMO_SOFT,
+    ENABLE_GEMINI,
+    GEMINI_MODEL,
+    GEMINI_RATE_RPD,
+    GEMINI_RATE_RPM,
+    GEMINI_RATE_TPM,
+    GEMINI_RPD_GUARD,
+    GEMINI_RPM_GUARD,
+    GEMINI_TPM_GUARD,
+    PROVIDER_ORDER,
 )
 from services.clients import (
     get_cerebras_client,
     get_gemini_client,
     get_lmstudio_client,
-    get_mistral_client,
 )
 from services.errors import is_cerebras_tpd_limit_error
 from services.feedback import load_feedback_examples
 
 
 _cerebras_use_extra_key: bool = False
-_mistral_fallback_active: bool = False
-_local_fallback_active: bool = False
 _lm_model_resolved_name: Optional[str] = None
-_mistral_disabled_logged: bool = False
-
-_mistral_semaphore = Semaphore(MISTRAL_MAX_CONCURRENCY)
-_mistral_rps_lock = Lock()
-_mistral_usage_lock = Lock()
-_mistral_serial_lock = Lock()
-_mistral_recent_requests: deque[float] = deque()
-_mistral_minute_usage: deque[tuple[float, int]] = deque()
-_mistral_month_usage: deque[tuple[float, int]] = deque()
-_mistral_force_single_thread: bool = MISTRAL_MAX_CONCURRENCY <= 1
-_mistral_downshift_active: bool = False
-_mistral_extra_delay_s: float = 0.0
-_MISTRAL_MONTH_WINDOW_S = 30 * 24 * 60 * 60
 
 _REMOTE_BATCH_CHUNK_SIZE = 4
 _LOG_ITEM_PREVIEW_LIMIT = 160
+_GEMINI_MAX_RETRIES = 2
 
 
 BatchEntry = str | tuple[Any, Optional[Any]] | Mapping[str, Any]
@@ -120,6 +103,8 @@ def _log_classifier_batch(
     *,
     level: int = logging.INFO,
     note: Optional[str] = None,
+    latency_ms: Optional[float] = None,
+    fallback_reason: Optional[str] = None,
 ) -> None:
     request_items = _summarize_batch_items_for_log(items)
     log_extra: dict[str, Any] = {
@@ -149,6 +134,10 @@ def _log_classifier_batch(
         log_extra["response_raw"] = raw_text
     if note:
         log_extra["note"] = note
+    if latency_ms is not None:
+        log_extra["latency_ms"] = round(latency_ms, 3)
+    if fallback_reason:
+        log_extra["fallback_reason"] = fallback_reason
     logger.log(level, "classifier_batch_processed", extra={"extra": log_extra})
 
 
@@ -162,9 +151,20 @@ def _finalize_batch_result(
     raw_text: str,
     items: list[_BatchWorkItem],
     parsed: dict[str, ClassificationResult],
+    *,
+    latency_ms: Optional[float] = None,
+    fallback_reason: Optional[str] = None,
 ) -> dict[str, ClassificationResult]:
     if parsed:
-        _log_classifier_batch(provider, items, payload_json, raw_text, parsed)
+        _log_classifier_batch(
+            provider,
+            items,
+            payload_json,
+            raw_text,
+            parsed,
+            latency_ms=latency_ms,
+            fallback_reason=fallback_reason,
+        )
         return parsed
 
     default_result = _default_batch_result(items)
@@ -176,66 +176,188 @@ def _finalize_batch_result(
         default_result,
         level=logging.WARNING,
         note="empty_or_unparsed_response",
+        latency_ms=latency_ms,
+        fallback_reason=fallback_reason,
     )
     return default_result
 
 
-def _can_use_mistral() -> bool:
-    api_key = _current_mistral_api_key()
-    available = bool(api_key)
-    global _mistral_disabled_logged
-    if available and _mistral_disabled_logged:
-        _mistral_disabled_logged = False
-    return available
+@dataclass
+class _RequestStamp:
+    timestamp: float
 
 
-def _current_mistral_api_key() -> str:
-    if MISTRAL_API_KEY:
-        return MISTRAL_API_KEY
-    return os.getenv("MISTRAL_API_KEY", "").strip()
+@dataclass
+class _TokenStamp:
+    timestamp: float
+    tokens: int
 
 
-def _current_mistral_model() -> str:
-    return os.getenv("MISTRAL_MODEL", MISTRAL_MODEL)
+@dataclass
+class _GeminiReservation:
+    manager: "GeminiQuotaManager"
+    minute_entries: list[_RequestStamp]
+    day_entries: list[_RequestStamp]
+    token_entry: Optional[_TokenStamp]
+    estimated_tokens: int
+    committed: bool = False
+    released: bool = False
+
+    def commit(self, prompt_tokens: int, completion_tokens: int) -> None:
+        if self.released or self.committed:
+            return
+        self.manager.commit(self, prompt_tokens, completion_tokens)
+        self.committed = True
+
+    def release(self) -> None:
+        if self.released or self.committed:
+            return
+        self.manager.release(self)
+        self.released = True
 
 
-def _acquire_mistral_slot():
-    _mistral_semaphore.acquire()
-    acquired_serial = False
-    while True:
-        now = time.monotonic()
-        with _mistral_rps_lock:
-            while _mistral_recent_requests and now - _mistral_recent_requests[0] >= 1.0:
-                _mistral_recent_requests.popleft()
-            if len(_mistral_recent_requests) < MISTRAL_MAX_RPS:
-                _mistral_recent_requests.append(now)
-                break
-            sleep_for = max(0.0, 1.0 - (now - _mistral_recent_requests[0]))
-        time.sleep(max(sleep_for, 0.05))
-    if _mistral_force_single_thread:
-        _mistral_serial_lock.acquire()
-        acquired_serial = True
-    delay = 0.0
-    with _mistral_usage_lock:
-        delay = _mistral_extra_delay_s
-    if delay > 0:
-        time.sleep(delay)
+class GeminiQuotaManager:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._minute_requests: deque[_RequestStamp] = deque()
+        self._minute_tokens: deque[_TokenStamp] = deque()
+        self._day_requests: deque[_RequestStamp] = deque()
+        self._minute_token_total = 0
 
-    def _release() -> None:
-        if acquired_serial:
-            _mistral_serial_lock.release()
-        _mistral_semaphore.release()
+    def _cleanup(self, now: Optional[float] = None) -> None:
+        timestamp = now or time.time()
+        minute_cutoff = timestamp - 60.0
+        day_cutoff = timestamp - 86400.0
+        while self._minute_requests and self._minute_requests[0].timestamp <= minute_cutoff:
+            self._minute_requests.popleft()
+        while self._minute_tokens and self._minute_tokens[0].timestamp <= minute_cutoff:
+            stamp = self._minute_tokens.popleft()
+            self._minute_token_total -= stamp.tokens
+        while self._day_requests and self._day_requests[0].timestamp <= day_cutoff:
+            self._day_requests.popleft()
 
-    return _release
+    def _guard_limit(self, limit: int, guard: float) -> Optional[int]:
+        if limit <= 0:
+            return None
+        threshold = int(limit * guard) if guard > 0 else 0
+        if threshold <= 0 or threshold > limit:
+            return limit
+        return threshold
+
+    def reserve(
+        self,
+        estimated_prompt_tokens: int,
+        estimated_output_tokens: int,
+        *,
+        request_count: int = 1,
+    ) -> tuple[Optional[_GeminiReservation], Optional[str]]:
+        with self._lock:
+            self._cleanup()
+            request_count = max(1, request_count)
+            estimated_prompt_tokens = max(0, estimated_prompt_tokens)
+            estimated_output_tokens = max(0, estimated_output_tokens)
+            total_tokens = estimated_prompt_tokens + estimated_output_tokens
+
+            projected_rpm = len(self._minute_requests) + request_count
+            projected_tpm = self._minute_token_total + total_tokens
+            projected_rpd = len(self._day_requests) + request_count
+
+            rpm_guard = self._guard_limit(GEMINI_RATE_RPM, GEMINI_RPM_GUARD)
+            if rpm_guard is not None and projected_rpm > rpm_guard:
+                return None, "rpm_guard"
+
+            tpm_guard = self._guard_limit(GEMINI_RATE_TPM, GEMINI_TPM_GUARD)
+            if tpm_guard is not None and projected_tpm > tpm_guard:
+                return None, "tpm_guard"
+
+            rpd_guard = self._guard_limit(GEMINI_RATE_RPD, GEMINI_RPD_GUARD)
+            if rpd_guard is not None and projected_rpd > rpd_guard:
+                return None, "rpd_guard"
+
+            now = time.time()
+            minute_entries = [
+                _RequestStamp(timestamp=now) for _ in range(request_count)
+            ]
+            for entry in minute_entries:
+                self._minute_requests.append(entry)
+            day_entries = [_RequestStamp(timestamp=now) for _ in range(request_count)]
+            for entry in day_entries:
+                self._day_requests.append(entry)
+            token_entry = None
+            if total_tokens > 0:
+                token_entry = _TokenStamp(timestamp=now, tokens=total_tokens)
+                self._minute_tokens.append(token_entry)
+                self._minute_token_total += total_tokens
+
+            reservation = _GeminiReservation(
+                manager=self,
+                minute_entries=minute_entries,
+                day_entries=day_entries,
+                token_entry=token_entry,
+                estimated_tokens=total_tokens,
+            )
+            return reservation, None
+
+    def release(self, reservation: _GeminiReservation) -> None:
+        with self._lock:
+            for entry in reservation.minute_entries:
+                try:
+                    self._minute_requests.remove(entry)
+                except ValueError:
+                    continue
+            for entry in reservation.day_entries:
+                try:
+                    self._day_requests.remove(entry)
+                except ValueError:
+                    continue
+            if reservation.token_entry is not None:
+                try:
+                    self._minute_tokens.remove(reservation.token_entry)
+                    self._minute_token_total -= reservation.token_entry.tokens
+                except ValueError:
+                    pass
+            reservation.minute_entries.clear()
+            reservation.day_entries.clear()
+            reservation.token_entry = None
+            reservation.estimated_tokens = 0
+
+    def commit(self, reservation: _GeminiReservation, prompt_tokens: int, completion_tokens: int) -> None:
+        total = max(0, (prompt_tokens or 0) + (completion_tokens or 0))
+        with self._lock:
+            if reservation.token_entry is not None:
+                diff = total - reservation.estimated_tokens
+                reservation.token_entry.tokens += diff
+                self._minute_token_total += diff
+            reservation.minute_entries.clear()
+            reservation.day_entries.clear()
+            reservation.token_entry = None
+            reservation.estimated_tokens = total
 
 
-def _mistral_backoff_delay(attempt: int) -> float:
-    attempt = max(1, attempt)
-    base = MISTRAL_BACKOFF_BASE_MS / 1000.0
-    maximum = MISTRAL_BACKOFF_MAX_MS / 1000.0
-    delay = base * (2 ** (attempt - 1))
-    jitter = random.uniform(0, base)
-    return min(maximum, delay + jitter)
+_gemini_quota_manager = GeminiQuotaManager()
+
+_ALLOWED_PROVIDERS = ("gemini", "cerebras", "local")
+
+
+def _build_provider_chain() -> tuple[str, ...]:
+    configured: list[str] = []
+    for provider in PROVIDER_ORDER:
+        normalized = provider.strip().lower()
+        if normalized not in _ALLOWED_PROVIDERS:
+            continue
+        if normalized == "gemini" and not ENABLE_GEMINI:
+            continue
+        if normalized not in configured:
+            configured.append(normalized)
+    for fallback in _ALLOWED_PROVIDERS:
+        if fallback == "gemini" and not ENABLE_GEMINI:
+            continue
+        if fallback not in configured:
+            configured.append(fallback)
+    return tuple(configured)
+
+
+_PROVIDER_CHAIN = _build_provider_chain()
 
 
 def _extract_status_code(e: Exception) -> Optional[int]:
@@ -249,95 +371,34 @@ def _extract_status_code(e: Exception) -> Optional[int]:
         return None
 
 
-def _is_mistral_retryable_error(e: Exception) -> tuple[bool, Optional[int], str]:
-    status = _extract_status_code(e)
-    try:
-        message = str(e).lower()
-    except Exception:
-        message = ""
-    if status == 429 or "429" in message or "too many requests" in message or "rate limit" in message:
-        return True, status, "rate"
-    transient_markers = [
-        "timeout",
-        "timed out",
-        "overload",
-        "overloaded",
-        "temporarily unavailable",
-        "temporarily_unavailable",
-        "unavailable",
-        "gateway",
-        "bad gateway",
-        "connection reset",
-        "connection aborted",
-        "server error",
-    ]
-    if status in {408} or (status is not None and 500 <= status < 600):
-        return True, status, "transient"
-    if any(marker in message for marker in transient_markers):
-        return True, status, "transient"
-    if status is not None and 400 <= status < 500:
-        return False, status, "client"
-    return True, status, "unknown"
+def _describe_gemini_error(exc: Exception) -> tuple[str, bool]:
+    status = _extract_status_code(exc)
+    message = str(exc).lower() if exc is not None else ""
+    if status == 429 or "429" in message or "rate limit" in message or "quota" in message:
+        return "gemini_rate_limit", False
+    if "timeout" in message or "timed out" in message:
+        return "gemini_timeout", True
+    if status is not None and 500 <= status < 600:
+        return f"gemini_http_{status}", True
+    if status in {408}:
+        return "gemini_timeout", True
+    if "unavailable" in message or "bad gateway" in message or "gateway" in message:
+        return "gemini_service_unavailable", True
+    return "gemini_error", True
 
 
-def _record_mistral_usage(usage: object) -> None:
-    if not usage:
-        return
-    try:
-        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-    except (TypeError, ValueError):
-        return
-    total_tokens = max(0, prompt_tokens + completion_tokens)
-    if total_tokens <= 0:
-        return
-    now = time.time()
-    minute_tokens = 0
-    month_tokens = 0
-    triggered_downshift = False
-    restored = False
-    global _mistral_force_single_thread, _mistral_downshift_active, _mistral_extra_delay_s
-    with _mistral_usage_lock:
-        _mistral_minute_usage.append((now, total_tokens))
-        _mistral_month_usage.append((now, total_tokens))
-        minute_cutoff = now - 60.0
-        month_cutoff = now - _MISTRAL_MONTH_WINDOW_S
-        while _mistral_minute_usage and _mistral_minute_usage[0][0] < minute_cutoff:
-            _mistral_minute_usage.popleft()
-        while _mistral_month_usage and _mistral_month_usage[0][0] < month_cutoff:
-            _mistral_month_usage.popleft()
-        minute_tokens = sum(tokens for _, tokens in _mistral_minute_usage)
-        month_tokens = sum(tokens for _, tokens in _mistral_month_usage)
-        minute_threshold = MISTRAL_TPM_SOFT * 0.8 if MISTRAL_TPM_SOFT else None
-        month_threshold = MISTRAL_TPMO_SOFT * 0.8 if MISTRAL_TPMO_SOFT else None
-        downshift_needed = False
-        if minute_threshold is not None and minute_tokens >= minute_threshold:
-            downshift_needed = True
-        if month_threshold is not None and month_tokens >= month_threshold:
-            downshift_needed = True
-        if downshift_needed and not _mistral_downshift_active:
-            _mistral_downshift_active = True
-            triggered_downshift = True
-            if MISTRAL_MAX_CONCURRENCY > 1:
-                _mistral_force_single_thread = True
-            if _mistral_extra_delay_s < 0.5:
-                _mistral_extra_delay_s = 0.5
-        elif not downshift_needed and _mistral_downshift_active:
-            _mistral_downshift_active = False
-            restored = True
-            if MISTRAL_MAX_CONCURRENCY > 1:
-                _mistral_force_single_thread = False
-            _mistral_extra_delay_s = 0.0
-    if triggered_downshift:
-        logger.warning(
-            "mistral_quota_downshift",
-            extra={"extra": {"minute_tokens": minute_tokens, "month_tokens": month_tokens}},
-        )
-    elif restored:
-        logger.info(
-            "mistral_quota_recovered",
-            extra={"extra": {"minute_tokens": minute_tokens, "month_tokens": month_tokens}},
-        )
+def _describe_cerebras_error(exc: Exception) -> str:
+    status = _extract_status_code(exc)
+    if is_cerebras_tpd_limit_error(exc):
+        return "cerebras_tpd"
+    if status == 429:
+        return "cerebras_rate_limit"
+    if status is not None and 500 <= status < 600:
+        return f"cerebras_http_{status}"
+    message = str(exc).lower() if exc is not None else ""
+    if "timeout" in message or "timed out" in message:
+        return "cerebras_timeout"
+    return "cerebras_error"
 
 
 def _parse_classifier_label(raw: object) -> ClassificationResult:
@@ -443,6 +504,16 @@ def _prepare_inputs(message_text: str, context: Optional[str]) -> tuple[str, Opt
     return text, ctx
 
 
+def _estimate_batch_prompt_tokens(prompt: str, payload_json: str) -> int:
+    return estimate_prompt_tokens(prompt) + estimate_prompt_tokens(payload_json)
+
+
+def _estimate_batch_output_tokens(items: Sequence[_BatchWorkItem]) -> int:
+    if not items:
+        return CLASSIFIER_MAX_OUTPUT_TOKENS
+    return max(CLASSIFIER_MAX_OUTPUT_TOKENS, CLASSIFIER_MAX_OUTPUT_TOKENS * len(items) + 8)
+
+
 _COMMAND_RE = re.compile(r"^[\s]*[!/].+")
 
 
@@ -510,51 +581,6 @@ def _parse_nested_value(value: Any, items: list[_BatchWorkItem]) -> dict[str, Cl
             return {}
         return _parse_batch_response(serialized, items)
     return {}
-
-
-def _extract_retry_after_seconds(exc: Exception) -> Optional[float]:
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None)
-    retry_after: Optional[str] = None
-    if headers is not None:
-        try:
-            retry_after = headers.get("Retry-After") if hasattr(headers, "get") else None
-        except Exception:  # noqa: BLE001
-            retry_after = None
-    if not retry_after:
-        return None
-    try:
-        return float(retry_after)
-    except (TypeError, ValueError):
-        try:
-            return float(int(retry_after))
-        except Exception:  # noqa: BLE001
-            return None
-
-
-def _increase_mistral_delay(retry_after: Optional[float]) -> None:
-    global _mistral_extra_delay_s, _mistral_force_single_thread
-    increment = retry_after if retry_after is not None else (MISTRAL_BACKOFF_BASE_MS / 1000.0)
-    maximum = MISTRAL_BACKOFF_MAX_MS / 1000.0
-    with _mistral_usage_lock:
-        current = _mistral_extra_delay_s
-        if current <= 0:
-            new_delay = increment
-        else:
-            new_delay = min(maximum, current * 1.5 + increment)
-        _mistral_extra_delay_s = min(maximum, max(new_delay, increment))
-        if MISTRAL_MAX_CONCURRENCY > 1:
-            _mistral_force_single_thread = True
-
-
-def _relax_mistral_delay() -> None:
-    global _mistral_extra_delay_s, _mistral_force_single_thread
-    with _mistral_usage_lock:
-        if _mistral_extra_delay_s <= 0:
-            return
-        _mistral_extra_delay_s = max(0.0, _mistral_extra_delay_s * 0.5 - 0.1)
-        if _mistral_extra_delay_s <= 0 and not _mistral_downshift_active and MISTRAL_MAX_CONCURRENCY > 1:
-            _mistral_force_single_thread = False
 
 
 def _build_classifier_prompt() -> str:
@@ -687,8 +713,75 @@ def _parse_batch_response(raw_text: str, items: list[_BatchWorkItem]) -> dict[st
     return {}
 
 
-def _call_cerebras_batch(prompt: str, payload_json: str, items: list[_BatchWorkItem]) -> dict[str, ClassificationResult]:
+def _call_gemini_batch(
+    prompt: str,
+    payload_json: str,
+    items: list[_BatchWorkItem],
+    reservation: _GeminiReservation,
+    estimated_prompt_tokens: int,
+    estimated_output_tokens: int,
+) -> dict[str, ClassificationResult]:
+    total_estimated = max(1, estimated_prompt_tokens + estimated_output_tokens)
+    gemini_rate_limiter.acquire_sync(total_estimated, rpd=GEMINI_RATE_RPD)
+    client = get_gemini_client()
+    max_tokens = _estimate_batch_output_tokens(items)
+    start = time.perf_counter()
+    try:
+     response = client.chat.completions.create(
+    model="gemma-3-27b-it",
+    messages=[
+        {
+            "role": "user",
+            "content": f"{prompt}\n\n# Входные данные\n{payload_json}"
+        },
+    ],
+    temperature=0.0,
+    top_p=1.0,
+    max_tokens=max_tokens,
+    n=1,
+)
+
+    except Exception:
+        reservation.release()
+        raise
+    latency_ms = (time.perf_counter() - start) * 1000.0
+    usage = getattr(response, "usage", None)
+    prompt_tokens = estimated_prompt_tokens
+    completion_tokens = estimated_output_tokens
+    if usage is not None:
+        try:
+            prompt_tokens = int(getattr(usage, "prompt_tokens", prompt_tokens) or prompt_tokens)
+        except (TypeError, ValueError):
+            prompt_tokens = estimated_prompt_tokens
+        try:
+            completion_tokens = int(
+                getattr(usage, "completion_tokens", completion_tokens) or completion_tokens
+            )
+        except (TypeError, ValueError):
+            completion_tokens = estimated_output_tokens
+    reservation.commit(prompt_tokens, completion_tokens)
+    raw_text = _extract_choice_text(response)
+    parsed = _parse_batch_response(raw_text, items)
+    return _finalize_batch_result(
+        "gemini",
+        payload_json,
+        raw_text,
+        items,
+        parsed,
+        latency_ms=latency_ms,
+    )
+
+
+def _call_cerebras_batch(
+    prompt: str,
+    payload_json: str,
+    items: list[_BatchWorkItem],
+    *,
+    fallback_reason: Optional[str] = None,
+) -> dict[str, ClassificationResult]:
     client = get_cerebras_client(CEREBRAS_EXTRA_API if _cerebras_use_extra_key and CEREBRAS_EXTRA_API else None)
+    max_tokens = _estimate_batch_output_tokens(items)
+    start = time.perf_counter()
     response = client.chat.completions.create(
         model=CEREBRAS_MODEL,
         messages=[
@@ -697,12 +790,21 @@ def _call_cerebras_batch(prompt: str, payload_json: str, items: list[_BatchWorkI
         ],
         temperature=0.0,
         top_p=1.0,
-        max_tokens=max(CLASSIFIER_MAX_OUTPUT_TOKENS, CLASSIFIER_MAX_OUTPUT_TOKENS * len(items) + 8),
+        max_tokens=max_tokens,
         extra_body={"reasoning_effort": "high"},
     )
+    latency_ms = (time.perf_counter() - start) * 1000.0
     raw_text = _extract_choice_text(response)
     parsed = _parse_batch_response(raw_text, items)
-    return _finalize_batch_result("cerebras", payload_json, raw_text, items, parsed)
+    return _finalize_batch_result(
+        "cerebras",
+        payload_json,
+        raw_text,
+        items,
+        parsed,
+        latency_ms=latency_ms,
+        fallback_reason=fallback_reason,
+    )
 
 
 def _resolve_lmstudio_model() -> str:
@@ -725,9 +827,17 @@ def _resolve_lmstudio_model() -> str:
     return _lm_model_resolved_name
 
 
-def _call_local_batch(prompt: str, payload_json: str, items: list[_BatchWorkItem]) -> dict[str, ClassificationResult]:
+def _call_local_batch(
+    prompt: str,
+    payload_json: str,
+    items: list[_BatchWorkItem],
+    *,
+    fallback_reason: Optional[str] = None,
+) -> dict[str, ClassificationResult]:
     client = get_lmstudio_client()
     model_name = _resolve_lmstudio_model()
+    max_tokens = _estimate_batch_output_tokens(items)
+    start = time.perf_counter()
     response = client.chat.completions.create(
         model=model_name,
         messages=[
@@ -736,146 +846,146 @@ def _call_local_batch(prompt: str, payload_json: str, items: list[_BatchWorkItem
         ],
         temperature=0.0,
         top_p=1.0,
-        max_tokens=max(CLASSIFIER_MAX_OUTPUT_TOKENS, CLASSIFIER_MAX_OUTPUT_TOKENS * len(items) + 8),
+        max_tokens=max_tokens,
         extra_body={"reasoning_effort": "medium"},
     )
+    latency_ms = (time.perf_counter() - start) * 1000.0
     raw_text = _extract_choice_text(response)
     parsed = _parse_batch_response(raw_text, items)
-    return _finalize_batch_result("lmstudio", payload_json, raw_text, items, parsed)
-
-
-def _call_mistral_batch(prompt: str, payload_json: str, items: list[_BatchWorkItem]) -> dict[str, ClassificationResult]:
-    if not _can_use_mistral():
-        raise RuntimeError("mistral_api_key_missing")
-    release = _acquire_mistral_slot()
-    try:
-        client = get_mistral_client()
-        response = client.chat.completions.create(
-            model=_current_mistral_model(),
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": payload_json},
-            ],
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=max(CLASSIFIER_MAX_OUTPUT_TOKENS, CLASSIFIER_MAX_OUTPUT_TOKENS * len(items) + 8),
-            response_format={"type": "json_object"},
-        )
-    finally:
-        release()
-    _record_mistral_usage(getattr(response, "usage", None))
-    raw_text = _extract_choice_text(response)
-    parsed = _parse_batch_response(raw_text, items)
-    _relax_mistral_delay()
-    return _finalize_batch_result("mistral", payload_json, raw_text, items, parsed)
+    return _finalize_batch_result(
+        "lmstudio",
+        payload_json,
+        raw_text,
+        items,
+        parsed,
+        latency_ms=latency_ms,
+        fallback_reason=fallback_reason,
+    )
 
 
 def _classify_remote_chunk(items: list[_BatchWorkItem], prompt: str) -> dict[str, ClassificationResult]:
     if not items:
         return {}
 
-    global _local_fallback_active, _cerebras_use_extra_key, _mistral_fallback_active
-    if not _local_fallback_active:
-        if _can_use_mistral():
-            _mistral_fallback_active = True
-        else:
-            _mistral_fallback_active = False
-    payload_json = _build_payload_json(items)
-    attempts = 0
-    mistral_attempts = 0
-    mistral_failed_this_cycle = False
+    global _cerebras_use_extra_key
 
-    while True:
-        try:
-            if _local_fallback_active:
-                provider = "lmstudio"
-                return _call_local_batch(prompt, payload_json, items)
-            if _mistral_fallback_active and not mistral_failed_this_cycle:
-                provider = "mistral"
-                result = _call_mistral_batch(prompt, payload_json, items)
-                _mistral_fallback_active = True
-                return result
-            provider = "cerebras"
-            return _call_cerebras_batch(prompt, payload_json, items)
-        except Exception as exc:  # noqa: BLE001
-            attempts += 1
-            if provider == "mistral":
-                retryable, status_code, category = _is_mistral_retryable_error(exc)
-                if retryable and not _local_fallback_active:
-                    mistral_attempts += 1
-                    retry_after = _extract_retry_after_seconds(exc) if status_code == 429 else None
-                    if status_code == 429:
-                        _increase_mistral_delay(retry_after)
-                    if mistral_attempts <= MISTRAL_MAX_RETRIES:
-                        delay = _mistral_backoff_delay(mistral_attempts)
-                        if retry_after is not None:
-                            delay = max(delay, retry_after)
-                        logger.warning(
-                            "mistral_retry",
-                            extra={
-                                "extra": {
-                                    "attempt": mistral_attempts,
-                                    "delay_s": round(delay, 3),
-                                    "status": status_code,
-                                    "category": category,
-                                    "retry_after": retry_after,
-                                    "error": str(exc),
-                                }
-                            },
-                        )
-                        time.sleep(delay)
-                        continue
-                    logger.warning(
-                        "mistral_retry_exhausted_switch_to_cerebras",
-                        extra={
-                            "extra": {
-                                "attempts": mistral_attempts,
-                                "status": status_code,
-                                "category": category,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                else:
-                    logger.warning(
-                        "mistral_error_switch_to_cerebras",
-                        extra={"extra": {"status": status_code, "category": category, "error": str(exc)}},
-                    )
-                mistral_failed_this_cycle = True
-                _mistral_fallback_active = False
+    payload_json = _build_payload_json(items)
+    estimated_prompt_tokens = _estimate_batch_prompt_tokens(prompt, payload_json)
+    estimated_output_tokens = _estimate_batch_output_tokens(items)
+    fallback_reason: Optional[str] = None
+
+    for provider in _PROVIDER_CHAIN:
+        if provider == "gemini":
+            reservation, guard_reason = _gemini_quota_manager.reserve(
+                estimated_prompt_tokens, estimated_output_tokens
+            )
+            if reservation is None:
+                fallback_reason = f"gemini_{guard_reason or 'guard'}"
+                logger.info(
+                    "gemini_guard_redirect",
+                    extra={
+                        "extra": {
+                            "reason": guard_reason or "guard",
+                            "batch_size": len(items),
+                            "estimated_prompt_tokens": estimated_prompt_tokens,
+                            "estimated_output_tokens": estimated_output_tokens,
+                        }
+                    },
+                )
                 continue
 
-            if provider == "cerebras" and not _local_fallback_active:
-                is_tpd = is_cerebras_tpd_limit_error(exc)
-                if is_tpd:
-                    if not _cerebras_use_extra_key and CEREBRAS_EXTRA_API:
-                        _cerebras_use_extra_key = True
-                        logger.warning("cerebras_tpd_switch_key", extra={"extra": {"error": str(exc)}})
-                        continue
-                    if _can_use_mistral():
-                        _mistral_fallback_active = True
-                        mistral_attempts = 0
-                        mistral_failed_this_cycle = False
-                        logger.warning("cerebras_tpd_switch_to_mistral", extra={"extra": {"error": str(exc)}})
-                        continue
-                    _local_fallback_active = True
+            attempt = 0
+            while True:
+                try:
+                    return _call_gemini_batch(
+                        prompt,
+                        payload_json,
+                        items,
+                        reservation,
+                        estimated_prompt_tokens,
+                        estimated_output_tokens,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    reservation.release()
+                    reason, retryable = _describe_gemini_error(exc)
+                    fallback_reason = reason
                     logger.warning(
-                        "cerebras_tpd_switch_to_lmstudio",
+                        "gemini_error_fallback",
                         extra={
                             "extra": {
+                                "attempt": attempt + 1,
+                                "retryable": retryable,
+                                "reason": reason,
                                 "error": str(exc),
-                                "mistral_available": False,
-                                "mistral_api_key_present": bool(_current_mistral_api_key()),
                             }
                         },
                     )
-                    continue
+                    if retryable and attempt < _GEMINI_MAX_RETRIES:
+                        attempt += 1
+                        new_reservation, guard_reason = _gemini_quota_manager.reserve(
+                            estimated_prompt_tokens, estimated_output_tokens
+                        )
+                        if new_reservation is None:
+                            fallback_reason = f"gemini_{guard_reason or 'guard'}"
+                            logger.info(
+                                "gemini_guard_after_retry",
+                                extra={
+                                    "extra": {
+                                        "reason": guard_reason or "guard",
+                                        "attempt": attempt,
+                                    }
+                                },
+                            )
+                            break
+                        reservation = new_reservation
+                        continue
+                    break
 
-            if attempts > 3:
-                logger.error("openai_classify_failed_all_fallbacks", extra={"extra": {"error": str(exc)}})
+        elif provider == "cerebras":
+            while True:
+                try:
+                    return _call_cerebras_batch(
+                        prompt,
+                        payload_json,
+                        items,
+                        fallback_reason=fallback_reason,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    reason = _describe_cerebras_error(exc)
+                    fallback_reason = reason
+                    logger.warning(
+                        "cerebras_error_fallback",
+                        extra={"extra": {"reason": reason, "error": str(exc)}},
+                    )
+                    if is_cerebras_tpd_limit_error(exc) and CEREBRAS_EXTRA_API and not _cerebras_use_extra_key:
+                        _cerebras_use_extra_key = True
+                        logger.warning(
+                            "cerebras_switch_extra_key",
+                            extra={"extra": {"error": str(exc)}},
+                        )
+                        continue
+                    break
+
+        elif provider == "local":
+            try:
+                return _call_local_batch(
+                    prompt,
+                    payload_json,
+                    items,
+                    fallback_reason=fallback_reason,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "local_classifier_error",
+                    extra={"extra": {"error": str(exc), "batch_size": len(items)}},
+                )
                 return {}
 
-            time.sleep(min(2 ** attempts, 10))
+    logger.error(
+        "classifier_providers_exhausted",
+        extra={"extra": {"batch_size": len(items), "fallback_reason": fallback_reason}},
+    )
+    return {}
 
 
 def _iter_remote_chunks(items: list[_BatchWorkItem], chunk_size: int) -> Iterable[list[_BatchWorkItem]]:

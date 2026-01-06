@@ -4,6 +4,8 @@ services:
     image: message_finder
     container_name: message_finder
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - LOG_LEVEL=INFO
       - REQUEST_TIMEOUT_S=20
@@ -25,6 +27,8 @@ services:
     image: message_finder
     container_name: warp_chat
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - LOG_LEVEL=INFO
       - REQUEST_TIMEOUT_S=20
